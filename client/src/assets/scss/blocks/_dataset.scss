@@ -1,0 +1,72 @@
+.dataset__container {
+  display: grid;
+  grid-template-columns: 1.25fr 0.9fr;
+  gap: 1rem;
+}
+
+.dataset__content,
+.dataset__panel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-m);
+  background: var(--surface);
+  box-shadow: var(--shadow-light);
+}
+
+.dataset__content {
+  padding: 1.4rem;
+}
+
+.dataset__title {
+  font-size: clamp(1.25rem, 2.3vw, 1.75rem);
+}
+
+.dataset__text {
+  margin-top: 0.7rem;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.dataset__list {
+  margin-top: 1rem;
+  display: grid;
+  gap: 0.6rem;
+}
+
+.dataset__item {
+  padding: 0.75rem 0.9rem;
+  border-radius: 10px;
+  background: var(--surface-soft);
+  color: var(--text-primary);
+}
+
+.dataset__panel {
+  padding: 1.15rem;
+  display: grid;
+  align-content: center;
+  gap: 0.9rem;
+  background: linear-gradient(160deg, var(--surface), #f9fcff);
+}
+
+.dataset__metric {
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  padding: 0.9rem;
+}
+
+.dataset__metric-label {
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+}
+
+.dataset__metric-value {
+  margin-top: 0.25rem;
+  display: block;
+  font-size: 1.18rem;
+  font-weight: 800;
+}
+
+@media (max-width: 940px) {
+  .dataset__container {
+    grid-template-columns: 1fr;
+  }
+}
