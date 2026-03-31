@@ -22,6 +22,8 @@ TfidfVectorizer = getattr(_sklearn_text, "TfidfVectorizer", None)
 _transformers = _optional_import("transformers")
 AutoModel = getattr(_transformers, "AutoModel", None)
 AutoTokenizer = getattr(_transformers, "AutoTokenizer", None)
+np = _optional_import("numpy")
+pd = _optional_import("pandas")
 
 
 def _require_torch() -> None:
@@ -239,6 +241,21 @@ class TfidfMicroCategoryRetriever:
 		detected = [mc_id for mc_id, _ in scored]
 		score_map = {mc_id: score for mc_id, score in scored}
 		return detected, score_map
+
+
+
+class SoftmaxModel(nn.Module):
+
+	def __init__(self, doc_features_dim, micro_cat_features_dim, embedding_dim, num_items):
+		super().__init__()
+
+		self.micro_cat_tower = nn.Sequential()
+		self.doc_tower = nn.Sequential()
+
+		self.num_items = num_items
+
+	def forward(self, mc_features, doc_features):
+		pass
 
 
 class TransformerSoftmaxSplitModel(nn.Module):
