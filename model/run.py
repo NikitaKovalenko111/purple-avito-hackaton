@@ -23,6 +23,7 @@ from model import (
     TrainingSettings,
     evaluate_retrieval_recall,
     evaluate_split_quality,
+    evaluate_split_probability_threshold,
     load_labeled_items_csv,
     load_labeled_items_jsonl,
     load_microcategories_from_csv,
@@ -43,16 +44,24 @@ DEFAULT_THRESHOLD_GRID: tuple[float, ...] = (0.08, 0.12, 0.16, 0.20, 0.24)
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train and evaluate the Avito split-draft pipeline.")
     parser.add_argument("--data-dir", type=Path, default=Path(__file__).resolve().parent.parent / "data")
-    parser.add_argument("--transformer-name", type=str, default="cointegrated/rubert-tiny2")
+    parser.add_argument("--transformer-name", type=str, default="DeepPavlov/rubert-base-cased")
     parser.add_argument("--tfidf-threshold", type=float, default=0.03)
     parser.add_argument("--tfidf-top-k", type=int, default=11)
-    parser.add_argument("--prob-threshold", type=float, default=0.16)
+    parser.add_argument("--prob-threshold", type=float, default=0.08)
+    parser.add_argument("--split-threshold", type=float, default=0.5)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=3e-5)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--patience", type=int, default=2)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument(
+        "--split-threshold-grid",
+        type=float,
+        nargs="+",
+        default=[0.35, 0.40, 0.45, 0.50, 0.55, 0.60],
+        help="Candidate shouldSplit thresholds to search on validation.",
+    )
     parser.add_argument(
         "--threshold-grid",
         type=float,
@@ -106,6 +115,7 @@ def main() -> None:
         tfidf_threshold=args.tfidf_threshold,
         tfidf_top_k=args.tfidf_top_k,
         prob_threshold=args.prob_threshold,
+        split_threshold=args.split_threshold,
         device=args.device,
     )
     training_settings = TrainingSettings(
@@ -150,6 +160,10 @@ def main() -> None:
         print("Validation metrics with tuned threshold:")
         threshold_report = search_best_probability_threshold(pipeline, val_items, training_settings.threshold_grid)
         print(json.dumps(threshold_report, ensure_ascii=False, indent=2))
+        split_threshold_report = evaluate_split_probability_threshold(pipeline, val_items, args.split_threshold_grid)
+        print("Validation split-threshold tuning:")
+        print(json.dumps(split_threshold_report, ensure_ascii=False, indent=2))
+        pipeline.split_threshold = split_threshold_report["threshold"]
         print(f"Retrieval recall on val: {evaluate_retrieval_recall(pipeline, val_items):.4f}")
         print("Final val metrics:")
         print(json.dumps(evaluate_split_quality(pipeline, val_items), ensure_ascii=False, indent=2))

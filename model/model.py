@@ -80,11 +80,11 @@ class PredictionResult:
 
 @dataclass
 class PipelineSettings:
-	transformer_name: str = "cointegrated/rubert-tiny2"
+	transformer_name: str = "DeepPavlov/rubert-base-cased"
 	tfidf_ngram_range: Tuple[int, int] = (2, 3)
 	tfidf_threshold: float = 0.03
 	tfidf_top_k: int = 11
-	prob_threshold: float = 0.16
+	prob_threshold: float = 0.08
 	split_threshold: float = 0.5
 	device: Optional[str] = None
 	max_length: int = 256
@@ -332,7 +332,7 @@ class DraftSplitPipeline:
 	def __init__(
 		self,
 		microcategories: Sequence[MicroCategory],
-		transformer_name: str = "cointegrated/rubert-tiny2",
+		transformer_name: str = "DeepPavlov/rubert-base-cased",
 		tfidf_ngram_range: Tuple[int, int] = (2, 3),
 		tfidf_threshold: float = 0.08,
 		tfidf_top_k: int = 11,
@@ -452,10 +452,8 @@ class DraftSplitPipeline:
 		return float(total_loss.detach().cpu().item())
 
 	def build_candidates(self, item: Item, force_include: Optional[Sequence[int]] = None) -> List[int]:
-		detected, _ = self.retriever.detect(item.description)
-		candidates = list(detected)
-		if item.mc_id not in candidates:
-			candidates.insert(0, item.mc_id)
+		# In the current problem we only have 11 microcategories, so filtering is not necessary.
+		candidates = [mc.mc_id for mc in self.microcategories]
 		if force_include:
 			for mc_id in force_include:
 				if mc_id not in candidates and mc_id in self.id_to_idx:
@@ -749,6 +747,7 @@ def evaluate_retrieval_recall(
 	pipeline: DraftSplitPipeline,
 	items: Sequence[LabeledItem],
 ) -> float:
+	# With full candidate set this becomes a sanity metric rather than a filter metric.
 	total = 0
 	hit = 0
 	for item in items:
