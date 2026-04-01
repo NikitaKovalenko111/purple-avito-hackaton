@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import csv
+import copy
 from dataclasses import dataclass
 import importlib
 import json
@@ -75,6 +76,28 @@ class PredictionResult:
 	should_split: bool
 	drafts: List[Draft]
 	probabilities: Dict[int, float]
+
+
+@dataclass
+class PipelineSettings:
+	transformer_name: str = "cointegrated/rubert-tiny2"
+	tfidf_ngram_range: Tuple[int, int] = (2, 3)
+	tfidf_threshold: float = 0.03
+	tfidf_top_k: int = 11
+	prob_threshold: float = 0.16
+	device: Optional[str] = None
+	max_length: int = 256
+
+
+@dataclass
+class TrainingSettings:
+	epochs: int = 5
+	batch_size: int = 8
+	lr: float = 3e-5
+	weight_decay: float = 0.01
+	patience: int = 2
+	min_delta: float = 1e-4
+	threshold_grid: Tuple[float, ...] = (0.08, 0.12, 0.16, 0.20, 0.24)
 
 
 def _parse_int_list(raw_value: Any) -> List[int]:
@@ -255,6 +278,7 @@ class TransformerSoftmaxSplitModel(nn.Module):
 		num_microcategories: int,
 		hidden_dim: Optional[int] = None,
 		dropout: float = 0.1,
+		max_length: int = 256,
 	) -> None:
 		_require_torch()
 		_require_transformers()
@@ -263,6 +287,7 @@ class TransformerSoftmaxSplitModel(nn.Module):
 		self.text_encoder = AutoModel.from_pretrained(model_name)
 		encoder_hidden = self.text_encoder.config.hidden_size
 		self.hidden_dim = hidden_dim or encoder_hidden
+		self.max_length = max_length
 
 		self.projection = nn.Linear(encoder_hidden, self.hidden_dim)
 		self.dropout = nn.Dropout(dropout)
@@ -280,7 +305,7 @@ class TransformerSoftmaxSplitModel(nn.Module):
 			list(texts),
 			padding=True,
 			truncation=True,
-			max_length=256,
+			max_length=self.max_length,
 			return_tensors="pt",
 		)
 		batch = {k: v.to(device) for k, v in batch.items()}
@@ -304,13 +329,25 @@ class DraftSplitPipeline:
 		transformer_name: str = "cointegrated/rubert-tiny2",
 		tfidf_ngram_range: Tuple[int, int] = (2, 3),
 		tfidf_threshold: float = 0.08,
+		tfidf_top_k: int = 8,
 		prob_threshold: float = 0.30,
+		max_length: int = 256,
 		device: Optional[str] = None,
+		settings: Optional[PipelineSettings] = None,
 	) -> None:
 		_require_torch()
 		self.microcategories = list(microcategories)
 		if not self.microcategories:
 			raise ValueError("microcategories must not be empty")
+
+		if settings is not None:
+			transformer_name = settings.transformer_name
+			tfidf_ngram_range = settings.tfidf_ngram_range
+			tfidf_threshold = settings.tfidf_threshold
+			tfidf_top_k = settings.tfidf_top_k
+			prob_threshold = settings.prob_threshold
+			max_length = settings.max_length
+			device = settings.device if settings.device is not None else device
 
 		self.id_to_title = {mc.mc_id: mc.mc_title for mc in self.microcategories}
 		self.id_to_idx = {mc.mc_id: i for i, mc in enumerate(self.microcategories)}
@@ -318,6 +355,7 @@ class DraftSplitPipeline:
 		self.retriever = TfidfMicroCategoryRetriever(
 			ngram_range=tfidf_ngram_range,
 			min_similarity=tfidf_threshold,
+			top_k=tfidf_top_k,
 		)
 		self.retriever.fit(self.microcategories)
 
@@ -325,6 +363,7 @@ class DraftSplitPipeline:
 		self.model = TransformerSoftmaxSplitModel(
 			model_name=transformer_name,
 			num_microcategories=len(self.microcategories),
+			max_length=max_length,
 		).to(self.device)
 		self.prob_threshold = prob_threshold
 
@@ -409,25 +448,105 @@ class DraftSplitPipeline:
 		optimizer: Any,
 		batch_size: int = 16,
 		epochs: int = 1,
+		force_include_targets: bool = False,
+		verbose: bool = False,
 	) -> List[float]:
 		history: List[float] = []
 		if batch_size <= 0:
 			raise ValueError("batch_size must be > 0")
 
 		for _ in range(epochs):
+			epoch_index = len(history) + 1
 			epoch_loss = 0.0
 			steps = 0
 			for i in range(0, len(items), batch_size):
 				batch = items[i : i + batch_size]
 				texts = [x.description for x in batch]
-				candidates = [self.build_candidates(x, force_include=x.target_split_mc_ids) for x in batch]
+				candidates = [
+					self.build_candidates(x, force_include=x.target_split_mc_ids if force_include_targets else None)
+					for x in batch
+				]
 				target_mc_ids = [x.target_split_mc_ids for x in batch]
 				source_mc_ids = [x.mc_id for x in batch]
 				loss = self.train_step(texts, candidates, target_mc_ids, source_mc_ids, optimizer)
 				epoch_loss += loss
 				steps += 1
-			history.append(epoch_loss / max(steps, 1))
+			epoch_avg_loss = epoch_loss / max(steps, 1)
+			history.append(epoch_avg_loss)
+			if verbose:
+				print(f"Epoch {epoch_index}/{epochs} | train_loss={epoch_avg_loss:.4f}")
 		return history
+
+	def fit_with_early_stopping(
+		self,
+		train_items: Sequence[LabeledItem],
+		val_items: Sequence[LabeledItem],
+		optimizer: Any,
+		training_settings: Optional[TrainingSettings] = None,
+		verbose: bool = True,
+	) -> Dict[str, Any]:
+		settings = training_settings or TrainingSettings()
+		best_state = None
+		best_metrics: Optional[Dict[str, float]] = None
+		best_threshold = self.prob_threshold
+		best_f1 = -1.0
+		patience_left = settings.patience
+		history: List[Dict[str, Any]] = []
+
+		for epoch in range(1, settings.epochs + 1):
+			loss_history = self.train_on_labeled_items(
+				train_items,
+				optimizer=optimizer,
+				batch_size=settings.batch_size,
+				epochs=1,
+				verbose=False,
+			)
+			loss_value = loss_history[-1] if loss_history else 0.0
+			threshold_report = search_best_probability_threshold(self, val_items, settings.threshold_grid)
+			val_metrics = threshold_report["metrics"]
+			current_f1 = val_metrics["f1_micro"]
+
+			if verbose:
+				print(
+					f"Epoch {epoch}/{settings.epochs} | "
+					f"train_loss={loss_value:.4f} | "
+					f"val_f1={current_f1:.4f} | "
+					f"val_precision={val_metrics['precision_micro']:.4f} | "
+					f"val_recall={val_metrics['recall_micro']:.4f} | "
+					f"shouldSplit_acc={val_metrics['should_split_accuracy']:.4f} | "
+					f"threshold={threshold_report['threshold']:.2f}"
+				)
+
+			history.append(
+				{
+					"epoch": epoch,
+					"loss": loss_value,
+					"threshold": threshold_report["threshold"],
+					"metrics": val_metrics,
+				}
+			)
+
+			if current_f1 > best_f1 + settings.min_delta:
+				best_f1 = current_f1
+				best_threshold = threshold_report["threshold"]
+				best_metrics = val_metrics
+				best_state = copy.deepcopy(self.model.state_dict())
+				patience_left = settings.patience
+			else:
+				patience_left -= 1
+				if patience_left <= 0:
+					break
+
+		if best_state is not None:
+			self.model.load_state_dict(best_state)
+		self.prob_threshold = best_threshold
+
+		return {
+			"history": history,
+			"best_threshold": best_threshold,
+			"best_metrics": best_metrics,
+			"best_f1": best_f1,
+		}
 
 	def score_candidates(self, description: str, candidate_mc_ids: Sequence[int]) -> Dict[int, float]:
 		if not candidate_mc_ids:
@@ -527,4 +646,50 @@ def evaluate_split_quality(
 		"f1_micro": f1,
 		"should_split_accuracy": accuracy,
 	}
+
+
+def search_best_probability_threshold(
+	pipeline: DraftSplitPipeline,
+	items: Sequence[LabeledItem],
+	thresholds: Sequence[float],
+) -> Dict[str, Any]:
+	if not thresholds:
+		raise ValueError("thresholds must not be empty")
+
+	original_threshold = pipeline.prob_threshold
+	best_threshold = original_threshold
+	best_metrics: Optional[Dict[str, float]] = None
+	best_f1 = -1.0
+	results: List[Dict[str, Any]] = []
+
+	for threshold in thresholds:
+		pipeline.prob_threshold = float(threshold)
+		metrics = evaluate_split_quality(pipeline, items)
+		results.append({"threshold": float(threshold), "metrics": metrics})
+		if metrics["f1_micro"] > best_f1:
+			best_f1 = metrics["f1_micro"]
+			best_threshold = float(threshold)
+			best_metrics = metrics
+
+	pipeline.prob_threshold = original_threshold
+	return {
+		"threshold": best_threshold,
+		"metrics": best_metrics or evaluate_split_quality(pipeline, items),
+		"results": results,
+	}
+
+
+def evaluate_retrieval_recall(
+	pipeline: DraftSplitPipeline,
+	items: Sequence[LabeledItem],
+) -> float:
+	total = 0
+	hit = 0
+	for item in items:
+		detected, _ = pipeline.retriever.detect(item.description)
+		pred_set = {mc_id for mc_id in detected if mc_id != item.mc_id}
+		gold_set = set(item.target_split_mc_ids)
+		total += len(gold_set)
+		hit += len(pred_set & gold_set)
+	return hit / total if total else 0.0
 
