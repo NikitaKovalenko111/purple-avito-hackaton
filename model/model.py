@@ -85,6 +85,7 @@ class PipelineSettings:
 	tfidf_threshold: float = 0.03
 	tfidf_top_k: int = 11
 	prob_threshold: float = 0.16
+	split_threshold: float = 0.5
 	device: Optional[str] = None
 	max_length: int = 256
 
@@ -95,6 +96,7 @@ class TrainingSettings:
 	batch_size: int = 8
 	lr: float = 3e-5
 	weight_decay: float = 0.01
+	split_loss_weight: float = 0.5
 	patience: int = 2
 	min_delta: float = 1e-4
 	threshold_grid: Tuple[float, ...] = (0.08, 0.12, 0.16, 0.20, 0.24)
@@ -205,7 +207,7 @@ class TfidfMicroCategoryRetriever:
 		self,
 		ngram_range: Tuple[int, int] = (2, 3),
 		min_similarity: float = 0.08,
-		top_k: int = 8,
+		top_k: int = 11,
 	) -> None:
 		_require_sklearn()
 		self.ngram_range = ngram_range
@@ -292,6 +294,7 @@ class TransformerSoftmaxSplitModel(nn.Module):
 		self.projection = nn.Linear(encoder_hidden, self.hidden_dim)
 		self.dropout = nn.Dropout(dropout)
 		self.mc_embeddings = nn.Embedding(num_microcategories, self.hidden_dim)
+		self.split_head = nn.Linear(self.hidden_dim, 1)
 		self.temperature = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
 
 	def _pool(self, last_hidden_state: Any, attention_mask: Any) -> Any:
@@ -319,6 +322,9 @@ class TransformerSoftmaxSplitModel(nn.Module):
 		temp = torch.clamp(self.temperature, min=0.05)
 		return logits / temp
 
+	def split_logits(self, text_embeddings: Any) -> Any:
+		return self.split_head(text_embeddings).squeeze(-1)
+
 
 class DraftSplitPipeline:
 	"""End-to-end pipeline for category detection and draft split prediction."""
@@ -329,8 +335,9 @@ class DraftSplitPipeline:
 		transformer_name: str = "cointegrated/rubert-tiny2",
 		tfidf_ngram_range: Tuple[int, int] = (2, 3),
 		tfidf_threshold: float = 0.08,
-		tfidf_top_k: int = 8,
+		tfidf_top_k: int = 11,
 		prob_threshold: float = 0.30,
+		split_threshold: float = 0.5,
 		max_length: int = 256,
 		device: Optional[str] = None,
 		settings: Optional[PipelineSettings] = None,
@@ -346,6 +353,7 @@ class DraftSplitPipeline:
 			tfidf_threshold = settings.tfidf_threshold
 			tfidf_top_k = settings.tfidf_top_k
 			prob_threshold = settings.prob_threshold
+			split_threshold = settings.split_threshold
 			max_length = settings.max_length
 			device = settings.device if settings.device is not None else device
 
@@ -366,17 +374,25 @@ class DraftSplitPipeline:
 			max_length=max_length,
 		).to(self.device)
 		self.prob_threshold = prob_threshold
+		self.split_threshold = split_threshold
 
 	def train_step(
 		self,
 		texts: Sequence[str],
 		candidate_mc_ids: Sequence[Sequence[int]],
 		target_mc_ids: Sequence[Sequence[int]],
+		should_split_targets: Sequence[bool],
 		source_mc_ids: Sequence[int],
 		optimizer: Any,
+		split_loss_weight: float = 0.5,
 	) -> float:
-		if len(texts) != len(candidate_mc_ids) or len(texts) != len(target_mc_ids) or len(texts) != len(source_mc_ids):
-			raise ValueError("texts, candidate_mc_ids, target_mc_ids and source_mc_ids must have equal lengths")
+		if (
+			len(texts) != len(candidate_mc_ids)
+			or len(texts) != len(target_mc_ids)
+			or len(texts) != len(should_split_targets)
+			or len(texts) != len(source_mc_ids)
+		):
+			raise ValueError("texts, candidate_mc_ids, target_mc_ids, should_split_targets and source_mc_ids must have equal lengths")
 
 		self.model.train()
 		total_loss = torch.tensor(0.0, device=self.device)
@@ -397,10 +413,11 @@ class DraftSplitPipeline:
 				target_vec.fill_(1.0 / len(candidates))
 			return target_vec
 
-		for text, candidates, target_mc_list, source_mc_id in zip(
+		for text, candidates, target_mc_list, should_split_target, source_mc_id in zip(
 			texts,
 			candidate_mc_ids,
 			target_mc_ids,
+			should_split_targets,
 			source_mc_ids,
 		):
 			if not candidates:
@@ -420,7 +437,10 @@ class DraftSplitPipeline:
 				target_distribution,
 				reduction="batchmean",
 			)
-			total_loss = total_loss + loss
+			split_logit = self.model.split_logits(text_emb).view(-1)
+			split_target = torch.tensor([1.0 if should_split_target else 0.0], device=self.device)
+			split_loss = nn.functional.binary_cross_entropy_with_logits(split_logit, split_target)
+			total_loss = total_loss + loss + split_loss_weight * split_loss
 			used_examples += 1
 
 		if used_examples == 0:
@@ -449,6 +469,7 @@ class DraftSplitPipeline:
 		batch_size: int = 16,
 		epochs: int = 1,
 		force_include_targets: bool = False,
+		split_loss_weight: float = 0.5,
 		verbose: bool = False,
 	) -> List[float]:
 		history: List[float] = []
@@ -467,8 +488,17 @@ class DraftSplitPipeline:
 					for x in batch
 				]
 				target_mc_ids = [x.target_split_mc_ids for x in batch]
+				should_split_targets = [x.should_split for x in batch]
 				source_mc_ids = [x.mc_id for x in batch]
-				loss = self.train_step(texts, candidates, target_mc_ids, source_mc_ids, optimizer)
+				loss = self.train_step(
+					texts,
+					candidates,
+					target_mc_ids,
+					should_split_targets,
+					source_mc_ids,
+					optimizer,
+					split_loss_weight=split_loss_weight,
+				)
 				epoch_loss += loss
 				steps += 1
 			epoch_avg_loss = epoch_loss / max(steps, 1)
@@ -499,6 +529,7 @@ class DraftSplitPipeline:
 				optimizer=optimizer,
 				batch_size=settings.batch_size,
 				epochs=1,
+				split_loss_weight=settings.split_loss_weight,
 				verbose=False,
 			)
 			loss_value = loss_history[-1] if loss_history else 0.0
@@ -573,11 +604,15 @@ class DraftSplitPipeline:
 		detected, tfidf_scores = self.retriever.detect(item.description)
 		detected_wo_source = [mc_id for mc_id in detected if mc_id != item.mc_id]
 		prob_map = self.score_candidates(item.description, detected_wo_source)
+		self.model.eval()
+		with torch.no_grad():
+			text_emb = self.model.encode_text([item.description], self.device)
+			split_prob = torch.sigmoid(self.model.split_logits(text_emb).view(-1)).item()
 
 		target_mc_ids = [
 			mc_id for mc_id, p in prob_map.items() if p >= self.prob_threshold and mc_id != item.mc_id
 		]
-		should_split = len(target_mc_ids) > 0
+		should_split = split_prob >= self.split_threshold
 
 		drafts = [
 			Draft(
@@ -672,6 +707,37 @@ def search_best_probability_threshold(
 			best_metrics = metrics
 
 	pipeline.prob_threshold = original_threshold
+	return {
+		"threshold": best_threshold,
+		"metrics": best_metrics or evaluate_split_quality(pipeline, items),
+		"results": results,
+	}
+
+
+def evaluate_split_probability_threshold(
+	pipeline: DraftSplitPipeline,
+	items: Sequence[LabeledItem],
+	thresholds: Sequence[float],
+) -> Dict[str, Any]:
+	if not thresholds:
+		raise ValueError("thresholds must not be empty")
+
+	original_threshold = pipeline.split_threshold
+	best_threshold = original_threshold
+	best_metrics: Optional[Dict[str, float]] = None
+	best_score = -1.0
+	results: List[Dict[str, Any]] = []
+
+	for threshold in thresholds:
+		pipeline.split_threshold = float(threshold)
+		metrics = evaluate_split_quality(pipeline, items)
+		results.append({"threshold": float(threshold), "metrics": metrics})
+		if metrics["should_split_accuracy"] > best_score:
+			best_score = metrics["should_split_accuracy"]
+			best_threshold = float(threshold)
+			best_metrics = metrics
+
+	pipeline.split_threshold = original_threshold
 	return {
 		"threshold": best_threshold,
 		"metrics": best_metrics or evaluate_split_quality(pipeline, items),
