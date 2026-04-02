@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tfidf-top-k", type=int, default=11)
     parser.add_argument("--prob-threshold", type=float, default=0.08)
     parser.add_argument("--split-threshold", type=float, default=0.5)
-    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=3e-5)
     parser.add_argument("--weight-decay", type=float, default=0.01)
@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_items(data_dir: Path, use_jsonl: bool) -> List[object]:
-    dataset_path = data_dir / ("rnc_dataset.jsonl" if use_jsonl else "rnc_dataset.csv")
+    dataset_path = data_dir / ("rnc_dataset_corrected.jsonl" if use_jsonl else "rnc_dataset_corrected.csv")
     if use_jsonl:
         return load_labeled_items_jsonl(str(dataset_path))
     return load_labeled_items_csv(str(dataset_path))
