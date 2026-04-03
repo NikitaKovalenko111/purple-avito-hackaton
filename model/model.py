@@ -5,6 +5,7 @@ import csv
 import copy
 from dataclasses import dataclass
 import importlib
+import itertools
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -24,6 +25,7 @@ TfidfVectorizer = getattr(_sklearn_text, "TfidfVectorizer", None)
 _transformers = _optional_import("transformers")
 AutoModel = getattr(_transformers, "AutoModel", None)
 AutoTokenizer = getattr(_transformers, "AutoTokenizer", None)
+_BaseModule = nn.Module if nn is not None else object
 
 
 def _require_torch() -> None:
@@ -88,13 +90,17 @@ class PipelineSettings:
     tfidf_top_k: int = 11
     prob_threshold: float = 0.08
     split_threshold: float = 0.5
+    max_drafts: int = 0
+    score_margin: float = 1.0
+    relative_ratio: float = 0.0
+    score_blend_alpha: float = 1.0
     device: Optional[str] = None
     max_length: int = 256
 
 
 @dataclass
 class TrainingSettings:
-    epochs: int = 10
+    epochs: int = 5
     batch_size: int = 8
     lr: float = 3e-5
     weight_decay: float = 0.01
@@ -292,7 +298,7 @@ class TfidfMicroCategoryRetriever:
         return detected, score_map
 
 
-class TransformerSoftmaxSplitModel(nn.Module):
+class TransformerSoftmaxSplitModel(_BaseModule):
     """
     Softmax model:
     - Transformer encodes ad text.
@@ -364,6 +370,10 @@ class DraftSplitPipeline:
             tfidf_top_k: int = 11,
             prob_threshold: float = 0.30,
             split_threshold: float = 0.5,
+            max_drafts: int = 0,
+            score_margin: float = 1.0,
+            relative_ratio: float = 0.0,
+            score_blend_alpha: float = 1.0,
             max_length: int = 256,
             device: Optional[str] = None,
             use_char_ngrams: bool = True,
@@ -381,6 +391,10 @@ class DraftSplitPipeline:
             tfidf_top_k = settings.tfidf_top_k
             prob_threshold = settings.prob_threshold
             split_threshold = settings.split_threshold
+            max_drafts = settings.max_drafts
+            score_margin = settings.score_margin
+            relative_ratio = settings.relative_ratio
+            score_blend_alpha = settings.score_blend_alpha
             max_length = settings.max_length
             device = settings.device if settings.device is not None else device
 
@@ -405,6 +419,11 @@ class DraftSplitPipeline:
         ).to(self.device)
         self.prob_threshold = prob_threshold
         self.split_threshold = split_threshold
+        self.class_prob_thresholds: Dict[int, float] = {}
+        self.max_drafts = max(0, int(max_drafts))
+        self.score_margin = max(0.0, float(score_margin))
+        self.relative_ratio = min(1.0, max(0.0, float(relative_ratio)))
+        self.score_blend_alpha = min(1.0, max(0.0, float(score_blend_alpha)))
 
     def train_step(
             self,
@@ -624,6 +643,63 @@ class DraftSplitPipeline:
             probs = torch.softmax(logits, dim=-1).detach().cpu().numpy()
             return {mc_id: float(prob) for mc_id, prob in zip(candidate_mc_ids, probs)}
 
+    def set_class_prob_thresholds(self, thresholds: Dict[int, float]) -> None:
+        self.class_prob_thresholds = {int(mc_id): float(threshold) for mc_id, threshold in thresholds.items()}
+
+    def get_class_prob_threshold(self, mc_id: int) -> float:
+        return float(self.class_prob_thresholds.get(mc_id, self.prob_threshold))
+
+    def set_reranking_controls(
+            self,
+            max_drafts: Optional[int] = None,
+            score_margin: Optional[float] = None,
+            relative_ratio: Optional[float] = None,
+            score_blend_alpha: Optional[float] = None,
+    ) -> None:
+        if max_drafts is not None:
+            self.max_drafts = max(0, int(max_drafts))
+        if score_margin is not None:
+            self.score_margin = max(0.0, float(score_margin))
+        if relative_ratio is not None:
+            self.relative_ratio = min(1.0, max(0.0, float(relative_ratio)))
+        if score_blend_alpha is not None:
+            self.score_blend_alpha = min(1.0, max(0.0, float(score_blend_alpha)))
+
+    def _blend_scores(
+            self,
+            prob_map: Dict[int, float],
+            tfidf_scores: Dict[int, float],
+            candidate_mc_ids: Sequence[int],
+    ) -> Dict[int, float]:
+        if not candidate_mc_ids:
+            return {}
+
+        tfidf_max = max([float(tfidf_scores.get(mc_id, 0.0)) for mc_id in candidate_mc_ids], default=0.0)
+        blended: Dict[int, float] = {}
+        for mc_id in candidate_mc_ids:
+            model_score = float(prob_map.get(mc_id, 0.0))
+            tfidf_score = float(tfidf_scores.get(mc_id, 0.0))
+            if tfidf_max > 0.0:
+                tfidf_score = tfidf_score / tfidf_max
+            blended[mc_id] = self.score_blend_alpha * model_score + (1.0 - self.score_blend_alpha) * tfidf_score
+        return blended
+
+    def _apply_reranking_controls(self, scored_items: List[Tuple[int, float]]) -> List[int]:
+        if not scored_items:
+            return []
+
+        top_score = float(scored_items[0][1])
+        selected: List[int] = []
+        for mc_id, score in scored_items:
+            within_margin = (top_score - float(score)) <= self.score_margin
+            within_ratio = True if self.relative_ratio <= 0.0 else float(score) >= top_score * self.relative_ratio
+            if within_margin and within_ratio:
+                selected.append(mc_id)
+
+        if self.max_drafts > 0:
+            selected = selected[: self.max_drafts]
+        return selected
+
     def _generate_draft_text(self, mc_title: str, description: str) -> str:
         short = " ".join(description.strip().split())
         short = short[:220] + ("..." if len(short) > 220 else "")
@@ -633,15 +709,22 @@ class DraftSplitPipeline:
         detected, tfidf_scores = self.retriever.detect(item.description)
         detected_wo_source = [mc_id for mc_id in detected if mc_id != item.mc_id]
         prob_map = self.score_candidates(item.description, detected_wo_source)
+        blended_scores = self._blend_scores(prob_map, tfidf_scores, detected_wo_source)
         self.model.eval()
         with torch.no_grad():
             text_emb = self.model.encode_text([item.description], self.device)
             split_prob = torch.sigmoid(self.model.split_logits(text_emb).view(-1)).item()
 
-        target_mc_ids = [
-            mc_id for mc_id, p in prob_map.items() if p >= self.prob_threshold and mc_id != item.mc_id
+        selected = [
+            (mc_id, score)
+            for mc_id, score in blended_scores.items()
+            if score >= self.get_class_prob_threshold(mc_id)
         ]
+        selected.sort(key=lambda x: x[1], reverse=True)
+        target_mc_ids = self._apply_reranking_controls(selected)
         should_split = split_prob >= self.split_threshold
+        if not should_split:
+            target_mc_ids = []
 
         drafts = [
             Draft(
@@ -652,8 +735,7 @@ class DraftSplitPipeline:
             for mc_id in target_mc_ids
         ]
 
-        merged_probs = {mc_id: float(tfidf_scores.get(mc_id, 0.0)) for mc_id in detected_wo_source}
-        merged_probs.update(prob_map)
+        merged_probs = blended_scores
 
         return PredictionResult(
             detected_mc_ids=detected,
@@ -712,10 +794,28 @@ def evaluate_split_quality(
     }
 
 
+def _selection_score(metrics: Dict[str, float], optimize_for: str, min_recall: float) -> float:
+    opt = optimize_for.strip().lower()
+    precision = float(metrics.get("precision_micro", 0.0))
+    recall = float(metrics.get("recall_micro", 0.0))
+    f1 = float(metrics.get("f1_micro", 0.0))
+
+    if recall < float(min_recall):
+        return -1.0
+
+    if opt == "precision":
+        return precision
+    if opt == "recall":
+        return recall
+    return f1
+
+
 def search_best_probability_threshold(
         pipeline: DraftSplitPipeline,
         items: Sequence[LabeledItem],
         thresholds: Sequence[float],
+        optimize_for: str = "f1",
+        min_recall: float = 0.0,
 ) -> Dict[str, Any]:
     if not thresholds:
         raise ValueError("thresholds must not be empty")
@@ -723,21 +823,25 @@ def search_best_probability_threshold(
     original_threshold = pipeline.prob_threshold
     best_threshold = original_threshold
     best_metrics: Optional[Dict[str, float]] = None
-    best_f1 = -1.0
+    best_score = -1.0
     results: List[Dict[str, Any]] = []
 
     for threshold in thresholds:
         pipeline.prob_threshold = float(threshold)
         metrics = evaluate_split_quality(pipeline, items)
-        results.append({"threshold": float(threshold), "metrics": metrics})
-        if metrics["f1_micro"] > best_f1:
-            best_f1 = metrics["f1_micro"]
+        score = _selection_score(metrics, optimize_for=optimize_for, min_recall=min_recall)
+        results.append({"threshold": float(threshold), "metrics": metrics, "score": score})
+        if score > best_score:
+            best_score = score
             best_threshold = float(threshold)
             best_metrics = metrics
 
     pipeline.prob_threshold = original_threshold
     return {
         "threshold": best_threshold,
+        "optimize_for": optimize_for,
+        "min_recall": float(min_recall),
+        "best_score": best_score,
         "metrics": best_metrics or evaluate_split_quality(pipeline, items),
         "results": results,
     }
@@ -770,6 +874,170 @@ def evaluate_split_probability_threshold(
     return {
         "threshold": best_threshold,
         "metrics": best_metrics or evaluate_split_quality(pipeline, items),
+        "results": results,
+    }
+
+
+def search_best_class_probability_thresholds(
+        pipeline: DraftSplitPipeline,
+        items: Sequence[LabeledItem],
+        thresholds: Sequence[float],
+        optimize_for: str = "f1",
+        min_recall: float = 0.0,
+) -> Dict[str, Any]:
+    if not thresholds:
+        raise ValueError("thresholds must not be empty")
+
+    original_thresholds = dict(pipeline.class_prob_thresholds)
+    class_support: Dict[int, int] = {}
+    for item in items:
+        for mc_id in item.target_split_mc_ids:
+            class_support[mc_id] = class_support.get(mc_id, 0) + 1
+
+    search_order = [mc_id for mc_id, _ in sorted(class_support.items(), key=lambda kv: (-kv[1], kv[0]))]
+    for mc_id in pipeline.id_to_title:
+        if mc_id not in search_order:
+            search_order.append(mc_id)
+
+    best_metrics = evaluate_split_quality(pipeline, items)
+    best_score = _selection_score(best_metrics, optimize_for=optimize_for, min_recall=min_recall)
+    per_class_results: List[Dict[str, Any]] = []
+    current_thresholds = dict(pipeline.class_prob_thresholds)
+
+    for mc_id in search_order:
+        base_threshold = current_thresholds.get(mc_id, pipeline.prob_threshold)
+        best_class_threshold = base_threshold
+        best_class_metrics = best_metrics
+        best_class_score = best_score
+
+        for threshold in thresholds:
+            pipeline.class_prob_thresholds[mc_id] = float(threshold)
+            metrics = evaluate_split_quality(pipeline, items)
+            score = _selection_score(metrics, optimize_for=optimize_for, min_recall=min_recall)
+            per_class_results.append(
+                {
+                    "mcId": mc_id,
+                    "mcTitle": pipeline.id_to_title[mc_id],
+                    "threshold": float(threshold),
+                    "metrics": metrics,
+                    "score": score,
+                }
+            )
+            if score > best_class_score:
+                best_class_score = score
+                best_class_threshold = float(threshold)
+                best_class_metrics = metrics
+
+        pipeline.class_prob_thresholds[mc_id] = best_class_threshold
+        current_thresholds[mc_id] = best_class_threshold
+        best_metrics = best_class_metrics
+        best_score = best_class_score
+
+    pipeline.class_prob_thresholds = current_thresholds
+    if not current_thresholds:
+        pipeline.class_prob_thresholds = original_thresholds
+
+    return {
+        "class_thresholds": dict(sorted(current_thresholds.items())),
+        "optimize_for": optimize_for,
+        "min_recall": float(min_recall),
+        "best_score": best_score,
+        "metrics": best_metrics,
+        "best_f1": best_metrics["f1_micro"],
+        "results": per_class_results,
+    }
+
+
+def search_best_reranking_controls(
+        pipeline: DraftSplitPipeline,
+        items: Sequence[LabeledItem],
+        max_drafts_grid: Sequence[int],
+        margin_grid: Sequence[float],
+        relative_ratio_grid: Sequence[float],
+        blend_alpha_grid: Sequence[float],
+        optimize_for: str = "f1",
+        min_recall: float = 0.0,
+) -> Dict[str, Any]:
+    if not max_drafts_grid:
+        raise ValueError("max_drafts_grid must not be empty")
+    if not margin_grid:
+        raise ValueError("margin_grid must not be empty")
+    if not relative_ratio_grid:
+        raise ValueError("relative_ratio_grid must not be empty")
+    if not blend_alpha_grid:
+        raise ValueError("blend_alpha_grid must not be empty")
+
+    orig_max_drafts = pipeline.max_drafts
+    orig_margin = pipeline.score_margin
+    orig_relative_ratio = pipeline.relative_ratio
+    orig_blend_alpha = pipeline.score_blend_alpha
+
+    best_metrics: Optional[Dict[str, float]] = None
+    best_score = -1.0
+    best_cfg = {
+        "max_drafts": orig_max_drafts,
+        "score_margin": orig_margin,
+        "relative_ratio": orig_relative_ratio,
+        "score_blend_alpha": orig_blend_alpha,
+    }
+    results: List[Dict[str, Any]] = []
+
+    for max_drafts, margin, ratio, blend_alpha in itertools.product(
+            max_drafts_grid,
+            margin_grid,
+            relative_ratio_grid,
+            blend_alpha_grid,
+    ):
+        pipeline.set_reranking_controls(
+            max_drafts=int(max_drafts),
+            score_margin=float(margin),
+            relative_ratio=float(ratio),
+            score_blend_alpha=float(blend_alpha),
+        )
+        metrics = evaluate_split_quality(pipeline, items)
+        score = _selection_score(metrics, optimize_for=optimize_for, min_recall=min_recall)
+        results.append(
+            {
+                "max_drafts": int(max_drafts),
+                "score_margin": float(margin),
+                "relative_ratio": float(ratio),
+                "score_blend_alpha": float(blend_alpha),
+                "metrics": metrics,
+                "score": score,
+            }
+        )
+        if score > best_score:
+            best_score = score
+            best_metrics = metrics
+            best_cfg = {
+                "max_drafts": int(max_drafts),
+                "score_margin": float(margin),
+                "relative_ratio": float(ratio),
+                "score_blend_alpha": float(blend_alpha),
+            }
+
+    pipeline.set_reranking_controls(
+        max_drafts=best_cfg["max_drafts"],
+        score_margin=best_cfg["score_margin"],
+        relative_ratio=best_cfg["relative_ratio"],
+        score_blend_alpha=best_cfg["score_blend_alpha"],
+    )
+
+    if best_metrics is None:
+        pipeline.set_reranking_controls(
+            max_drafts=orig_max_drafts,
+            score_margin=orig_margin,
+            relative_ratio=orig_relative_ratio,
+            score_blend_alpha=orig_blend_alpha,
+        )
+        best_metrics = evaluate_split_quality(pipeline, items)
+
+    return {
+        "optimize_for": optimize_for,
+        "min_recall": float(min_recall),
+        "best_score": best_score,
+        "best_controls": best_cfg,
+        "metrics": best_metrics,
         "results": results,
     }
 
