@@ -100,7 +100,7 @@ class PipelineSettings:
     device: Optional[str] = None
     max_length: int = 256
     use_llm_drafts: bool = False
-    openrouter_model: str = "qwen/qwen3-6-plus:free"
+    openrouter_model: str = "qwen/qwen3.6-plus:free"
     openrouter_api_key: Optional[str] = None
     openrouter_base_url: str = "https://openrouter.ai/api/v1/chat/completions"
     openrouter_timeout_sec: float = 30.0
@@ -388,7 +388,7 @@ class DraftSplitPipeline:
             device: Optional[str] = None,
             use_char_ngrams: bool = True,
                 use_llm_drafts: bool = False,
-                openrouter_model: str = "qwen/qwen3-6-plus:free",
+                openrouter_model: str = "qwen/qwen3.6-plus:free",
                 openrouter_api_key: Optional[str] = None,
                 openrouter_base_url: str = "https://openrouter.ai/api/v1/chat/completions",
                 openrouter_timeout_sec: float = 30.0,
@@ -455,6 +455,9 @@ class DraftSplitPipeline:
         self.openrouter_site_url = openrouter_site_url
         self.openrouter_app_name = str(openrouter_app_name)
         self.openrouter_api_key = openrouter_api_key or os.getenv("OPENROUTER_API_KEY")
+        self.llm_success_count = 0
+        self.llm_fallback_count = 0
+        self.last_llm_error: Optional[str] = None
 
     def train_step(
             self,
@@ -753,6 +756,8 @@ class DraftSplitPipeline:
 
     def _generate_llm_draft_text(self, mc_title: str, description: str) -> Optional[str]:
         if not self.use_llm_drafts or not self.openrouter_api_key:
+            if self.use_llm_drafts and not self.openrouter_api_key:
+                self.last_llm_error = "OPENROUTER_API_KEY is missing"
             return None
 
         payload = {
@@ -797,17 +802,48 @@ class DraftSplitPipeline:
                 .get("content", "")
             )
             if not isinstance(content, str):
+                self.last_llm_error = "OpenRouter response has no text content"
                 return None
             cleaned = " ".join(content.strip().split())
+            if cleaned:
+                self.last_llm_error = None
             return cleaned[:260] if cleaned else None
-        except (urllib_error.URLError, urllib_error.HTTPError, TimeoutError, json.JSONDecodeError, KeyError, IndexError):
+        except urllib_error.HTTPError as exc:
+            details = ""
+            try:
+                details = exc.read().decode("utf-8")[:240]
+            except Exception:
+                details = ""
+            self.last_llm_error = f"HTTP {exc.code}: {details or exc.reason}"
+            return None
+        except urllib_error.URLError as exc:
+            self.last_llm_error = f"URL error: {exc.reason}"
+            return None
+        except TimeoutError:
+            self.last_llm_error = "Timeout while calling OpenRouter"
+            return None
+        except (json.JSONDecodeError, KeyError, IndexError) as exc:
+            self.last_llm_error = f"Invalid OpenRouter response: {exc}"
             return None
 
     def _generate_draft_text(self, mc_title: str, description: str) -> str:
         llm_text = self._generate_llm_draft_text(mc_title, description)
         if llm_text:
+            self.llm_success_count += 1
             return llm_text
+        if self.use_llm_drafts:
+            self.llm_fallback_count += 1
         return self._generate_template_draft_text(mc_title, description)
+
+    def get_llm_diagnostics(self) -> Dict[str, Any]:
+        return {
+            "enabled": bool(self.use_llm_drafts),
+            "success_count": int(self.llm_success_count),
+            "fallback_count": int(self.llm_fallback_count),
+            "last_error": self.last_llm_error,
+            "model": self.openrouter_model,
+            "api_key_present": bool(self.openrouter_api_key),
+        }
 
     def predict(self, item: Item) -> PredictionResult:
         detected, tfidf_scores = self.retriever.detect(item.description)

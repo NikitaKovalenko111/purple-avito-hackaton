@@ -142,7 +142,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--openrouter-model",
         type=str,
-        default="qwen/qwen3-6-plus:free",
+        default="qwen/qwen3.6-plus:free",
         help="OpenRouter model name for draft generation.",
     )
     parser.add_argument(
@@ -281,6 +281,8 @@ def main() -> None:
     print(f"Loaded: train={len(train_items)}, val={len(val_items)}, test={len(test_items)}")
 
     transformer_name = str(checkpoint.get("transformer_name", args.transformer_name))
+    use_llm_drafts = bool(args.use_llm_drafts or checkpoint_config.get("use_llm_drafts", False))
+    openrouter_api_key = args.openrouter_api_key or checkpoint_config.get("openrouter_api_key")
     pipeline_settings = PipelineSettings(
         transformer_name=transformer_name,
         tfidf_threshold=float(checkpoint_config.get("tfidf_threshold", args.tfidf_threshold)),
@@ -292,13 +294,13 @@ def main() -> None:
         relative_ratio=float(checkpoint_config.get("relative_ratio", args.relative_ratio)),
         score_blend_alpha=float(checkpoint_config.get("score_blend_alpha", args.score_blend_alpha)),
         device=args.device,
-        use_llm_drafts=bool(checkpoint_config.get("use_llm_drafts", args.use_llm_drafts)),
-        openrouter_model=str(checkpoint_config.get("openrouter_model", args.openrouter_model)),
-        openrouter_api_key=checkpoint_config.get("openrouter_api_key", args.openrouter_api_key),
-        openrouter_base_url=str(checkpoint_config.get("openrouter_base_url", args.openrouter_base_url)),
-        openrouter_timeout_sec=float(checkpoint_config.get("openrouter_timeout_sec", args.openrouter_timeout_sec)),
-        openrouter_site_url=checkpoint_config.get("openrouter_site_url", args.openrouter_site_url),
-        openrouter_app_name=str(checkpoint_config.get("openrouter_app_name", args.openrouter_app_name)),
+        use_llm_drafts=use_llm_drafts,
+        openrouter_model=str(args.openrouter_model),
+        openrouter_api_key=openrouter_api_key,
+        openrouter_base_url=str(args.openrouter_base_url),
+        openrouter_timeout_sec=float(args.openrouter_timeout_sec),
+        openrouter_site_url=args.openrouter_site_url,
+        openrouter_app_name=str(args.openrouter_app_name),
     )
     training_settings = TrainingSettings(
         epochs=args.epochs,
@@ -314,10 +316,15 @@ def main() -> None:
         settings=pipeline_settings,
     )
     llm_requested = bool(pipeline.use_llm_drafts)
+    # Metrics should be deterministic and fast: avoid LLM calls on full val/test sets.
+    pipeline.use_llm_drafts = False
+    print(f"LLM drafts enabled: {llm_requested}")
+    if llm_requested:
+        print(f"OpenRouter model: {pipeline.openrouter_model}")
+        print(f"OpenRouter API key present: {bool(pipeline.openrouter_api_key)}")
 
     if not checkpoint_mode and llm_requested:
         # Keep training/tuning deterministic and fast: use template drafts in this phase.
-        pipeline.use_llm_drafts = False
         print("LLM drafts are disabled for training/validation/test metrics and enabled only for sample output.")
 
     if checkpoint_mode:
@@ -420,13 +427,18 @@ def main() -> None:
         
         print("\nTest sample prediction (first item):")
         sample = test_items[0]
-        enable_llm_for_sample = llm_requested and not checkpoint_mode
+        enable_llm_for_sample = llm_requested
+        pipeline.llm_success_count = 0
+        pipeline.llm_fallback_count = 0
+        pipeline.last_llm_error = None
         if enable_llm_for_sample:
             pipeline.use_llm_drafts = True
         result = pipeline.predict(sample)
         if enable_llm_for_sample:
             pipeline.use_llm_drafts = False
         print(json.dumps(to_response_json(result), ensure_ascii=False, indent=2))
+        print("LLM diagnostics:")
+        print(json.dumps(pipeline.get_llm_diagnostics(), ensure_ascii=False, indent=2))
 
     if not checkpoint_mode:
         # Save model checkpoint

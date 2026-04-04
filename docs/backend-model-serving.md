@@ -35,10 +35,11 @@ pip install torch transformers scikit-learn fastapi uvicorn
 
 ```env
 OPENROUTER_API_KEY=your_openrouter_api_key_here
-OPENROUTER_MODEL=qwen/qwen3-6-plus:free
+OPENROUTER_MODEL=qwen/qwen3.6-plus:free
 ```
 
 Примечания:
+
 - Если OPENROUTER_API_KEY не задан, генерация через LLM не упадет, пайплайн использует шаблонный fallback.
 - Для прода рекомендуется хранить ключ в секретах окружения (Vault/K8s Secret), а не в файле.
 
@@ -116,7 +117,7 @@ def startup() -> None:
         relative_ratio=float(config.get("relative_ratio", 0.0)),
         score_blend_alpha=float(config.get("score_blend_alpha", 1.0)),
         use_llm_drafts=True,
-        openrouter_model=os.getenv("OPENROUTER_MODEL", "qwen/qwen3-6-plus:free"),
+        openrouter_model=os.getenv("OPENROUTER_MODEL", "qwen/qwen3.6-plus:free"),
         openrouter_api_key=os.getenv("OPENROUTER_API_KEY"),
     )
 
@@ -181,15 +182,15 @@ curl -X POST http://localhost:8000/predict \
 
 ```json
 {
-  "detectedMcIds": [101, 110, 111, 108, 104, 102],
-  "shouldSplit": true,
-  "drafts": [
-    {
-      "mcId": 110,
-      "mcTitle": "Гипсокартон",
-      "text": "..."
-    }
-  ]
+    "detectedMcIds": [101, 110, 111, 108, 104, 102],
+    "shouldSplit": true,
+    "drafts": [
+        {
+            "mcId": 110,
+            "mcTitle": "Гипсокартон",
+            "text": "..."
+        }
+    ]
 }
 ```
 

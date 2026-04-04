@@ -5,3 +5,4 @@ client-markup
 .env
 .env.*
 !.env.example
+checkpoints
