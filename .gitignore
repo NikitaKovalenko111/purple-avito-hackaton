@@ -2,3 +2,6 @@ __pycache__
 .idea
 .vscode
 client-markup
+.env
+.env.*
+!.env.example

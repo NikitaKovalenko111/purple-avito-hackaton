@@ -7,8 +7,11 @@ from dataclasses import dataclass
 import importlib
 import itertools
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 
 def _optional_import(module_name: str) -> Any:
@@ -96,6 +99,13 @@ class PipelineSettings:
     score_blend_alpha: float = 1.0
     device: Optional[str] = None
     max_length: int = 256
+    use_llm_drafts: bool = False
+    openrouter_model: str = "qwen/qwen3-6-plus:free"
+    openrouter_api_key: Optional[str] = None
+    openrouter_base_url: str = "https://openrouter.ai/api/v1/chat/completions"
+    openrouter_timeout_sec: float = 30.0
+    openrouter_site_url: Optional[str] = None
+    openrouter_app_name: str = "purple-avito-hackaton"
 
 
 @dataclass
@@ -377,6 +387,13 @@ class DraftSplitPipeline:
             max_length: int = 256,
             device: Optional[str] = None,
             use_char_ngrams: bool = True,
+                use_llm_drafts: bool = False,
+                openrouter_model: str = "qwen/qwen3-6-plus:free",
+                openrouter_api_key: Optional[str] = None,
+                openrouter_base_url: str = "https://openrouter.ai/api/v1/chat/completions",
+                openrouter_timeout_sec: float = 30.0,
+                openrouter_site_url: Optional[str] = None,
+                openrouter_app_name: str = "purple-avito-hackaton",
             settings: Optional[PipelineSettings] = None,
     ) -> None:
         _require_torch()
@@ -397,6 +414,13 @@ class DraftSplitPipeline:
             score_blend_alpha = settings.score_blend_alpha
             max_length = settings.max_length
             device = settings.device if settings.device is not None else device
+            use_llm_drafts = settings.use_llm_drafts
+            openrouter_model = settings.openrouter_model
+            openrouter_api_key = settings.openrouter_api_key
+            openrouter_base_url = settings.openrouter_base_url
+            openrouter_timeout_sec = settings.openrouter_timeout_sec
+            openrouter_site_url = settings.openrouter_site_url
+            openrouter_app_name = settings.openrouter_app_name
 
         self.id_to_title = {mc.mc_id: mc.mc_title for mc in self.microcategories}
         self.id_to_idx = {mc.mc_id: i for i, mc in enumerate(self.microcategories)}
@@ -424,6 +448,13 @@ class DraftSplitPipeline:
         self.score_margin = max(0.0, float(score_margin))
         self.relative_ratio = min(1.0, max(0.0, float(relative_ratio)))
         self.score_blend_alpha = min(1.0, max(0.0, float(score_blend_alpha)))
+        self.use_llm_drafts = bool(use_llm_drafts)
+        self.openrouter_model = str(openrouter_model)
+        self.openrouter_base_url = str(openrouter_base_url)
+        self.openrouter_timeout_sec = float(openrouter_timeout_sec)
+        self.openrouter_site_url = openrouter_site_url
+        self.openrouter_app_name = str(openrouter_app_name)
+        self.openrouter_api_key = openrouter_api_key or os.getenv("OPENROUTER_API_KEY")
 
     def train_step(
             self,
@@ -700,10 +731,83 @@ class DraftSplitPipeline:
             selected = selected[: self.max_drafts]
         return selected
 
-    def _generate_draft_text(self, mc_title: str, description: str) -> str:
+    def _generate_template_draft_text(self, mc_title: str, description: str) -> str:
         short = " ".join(description.strip().split())
         short = short[:220] + ("..." if len(short) > 220 else "")
         return f"Выполняем работы по направлению \"{mc_title}\". Опыт и аккуратное исполнение. {short}"
+
+    def _build_llm_draft_prompt(self, mc_title: str, description: str) -> str:
+        source = " ".join(description.strip().split())
+        source = source[:1000]
+        return (
+            "Сгенерируй короткий продающий черновик объявления на русском языке.\\n"
+            "Ограничения:\\n"
+            "- 1-2 предложения, до 260 символов.\\n"
+            "- Без markdown, без списков, без кавычек-елочек.\\n"
+            "- Только конкретика по категории, без выдумывания услуг, которых нет в тексте.\\n"
+            "- Нейтрально-деловой тон.\\n"
+            f"Категория: {mc_title}\\n"
+            f"Исходный текст: {source}\\n"
+            "Верни только готовый текст черновика."
+        )
+
+    def _generate_llm_draft_text(self, mc_title: str, description: str) -> Optional[str]:
+        if not self.use_llm_drafts or not self.openrouter_api_key:
+            return None
+
+        payload = {
+            "model": self.openrouter_model,
+            "temperature": 0.35,
+            "max_tokens": 180,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Ты копирайтер для объявлений о ремонте. Пиши кратко, конкретно и безопасно.",
+                },
+                {
+                    "role": "user",
+                    "content": self._build_llm_draft_prompt(mc_title, description),
+                },
+            ],
+        }
+
+        headers = {
+            "Authorization": f"Bearer {self.openrouter_api_key}",
+            "Content-Type": "application/json",
+        }
+        if self.openrouter_site_url:
+            headers["HTTP-Referer"] = self.openrouter_site_url
+        if self.openrouter_app_name:
+            headers["X-Title"] = self.openrouter_app_name
+
+        request = urllib_request.Request(
+            self.openrouter_base_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+
+        try:
+            with urllib_request.urlopen(request, timeout=self.openrouter_timeout_sec) as response:
+                body = response.read().decode("utf-8")
+            parsed = json.loads(body)
+            content = (
+                parsed.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+            )
+            if not isinstance(content, str):
+                return None
+            cleaned = " ".join(content.strip().split())
+            return cleaned[:260] if cleaned else None
+        except (urllib_error.URLError, urllib_error.HTTPError, TimeoutError, json.JSONDecodeError, KeyError, IndexError):
+            return None
+
+    def _generate_draft_text(self, mc_title: str, description: str) -> str:
+        llm_text = self._generate_llm_draft_text(mc_title, description)
+        if llm_text:
+            return llm_text
+        return self._generate_template_draft_text(mc_title, description)
 
     def predict(self, item: Item) -> PredictionResult:
         detected, tfidf_scores = self.retriever.detect(item.description)
