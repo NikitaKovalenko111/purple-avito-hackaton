@@ -46,7 +46,7 @@ DEFAULT_THRESHOLD_GRID: tuple[float, ...] = (0.08, 0.12, 0.16, 0.20, 0.24)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train and evaluate the Avito split-draft pipeline.")
-    parser.add_argument("--data-dir", type=Path, default=Path(__file__).resolve().parent.parent / "data")
+    parser.add_argument("--data-dir", type=Path, default=Path(__file__).resolve().parent / "data")
     parser.add_argument("--transformer-name", type=str, default="DeepPavlov/rubert-base-cased")
     parser.add_argument("--tfidf-threshold", type=float, default=0.03)
     parser.add_argument("--tfidf-top-k", type=int, default=11)
@@ -184,7 +184,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path(__file__).resolve().parent.parent / "checkpoints",
+        default=Path(__file__).resolve().parent / "checkpoints",
         help="Directory to save model checkpoints and results.",
     )
     return parser.parse_args()
@@ -201,7 +201,7 @@ def resolve_data_dir(data_dir: Path) -> Path:
     if data_dir.exists():
         return data_dir
 
-    fallback = Path(__file__).resolve().parent.parent / "data"
+    fallback = Path(__file__).resolve().parent / "data"
     if fallback.exists():
         return fallback
 

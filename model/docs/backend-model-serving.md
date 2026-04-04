@@ -7,7 +7,7 @@
 - Обучение и оффлайн-оценка: model/run.py
 - Модель и пайплайн: model/model.py
 - Формат ответа API: функция to_response_json(...) в model/model.py
-- Чекпоинт после обучения: checkpoints/model_checkpoint.pt
+- Чекпоинт после обучения: model/checkpoints/model_checkpoint.pt
 
 ## 2. Подготовка сервера
 
@@ -17,7 +17,7 @@
 python -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
-pip install torch transformers scikit-learn fastapi uvicorn
+pip install -r model/requirements.txt
 ```
 
 Для Windows PowerShell:
@@ -26,7 +26,7 @@ pip install torch transformers scikit-learn fastapi uvicorn
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install --upgrade pip
-pip install torch transformers scikit-learn fastapi uvicorn
+pip install -r model\requirements.txt
 ```
 
 ## 3. Переменные окружения (.env)
@@ -61,9 +61,10 @@ from pydantic import BaseModel, Field
 from model import DraftSplitPipeline, Item, PipelineSettings, load_microcategories_from_csv, to_response_json
 
 
-ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = ROOT / "data"
-CHECKPOINT_PATH = ROOT / "checkpoints" / "model_checkpoint.pt"
+MODEL_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = MODEL_ROOT.parent
+DATA_DIR = MODEL_ROOT / "data"
+CHECKPOINT_PATH = MODEL_ROOT / "checkpoints" / "model_checkpoint.pt"
 
 
 def load_env(env_path: Path) -> None:
@@ -96,7 +97,7 @@ pipeline: Optional[DraftSplitPipeline] = None
 def startup() -> None:
     global pipeline
 
-    load_env(ROOT / ".env")
+    load_env(PROJECT_ROOT / ".env")
 
     microcategories = load_microcategories_from_csv(str(DATA_DIR / "rnc_mic_key_phrases.csv"))
 
@@ -204,8 +205,8 @@ curl -X POST http://localhost:8000/predict \
 
 ## 8. Быстрый чек-лист перед релизом
 
-- Есть файл checkpoints/model_checkpoint.pt
-- Есть data/rnc_mic_key_phrases.csv
+- Есть файл model/checkpoints/model_checkpoint.pt
+- Есть model/data/rnc_mic_key_phrases.csv
 - OPENROUTER_API_KEY задан
 - /health отвечает 200
 - /predict возвращает JSON со схемой detectedMcIds/shouldSplit/drafts
