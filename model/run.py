@@ -211,7 +211,17 @@ def resolve_data_dir(data_dir: Path) -> Path:
 def _load_checkpoint(checkpoint_path: Path) -> Dict[str, Any]:
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    checkpoint = torch.load(str(checkpoint_path), map_location="cpu")
+
+    # PyTorch 2.6 changed default torch.load(..., weights_only=True).
+    # Our checkpoints include metadata (e.g. custom classes), so we fall back
+    # to weights_only=False for trusted local files.
+    try:
+        checkpoint = torch.load(str(checkpoint_path), map_location="cpu")
+    except Exception as exc:
+        if "Weights only load failed" not in str(exc):
+            raise
+        checkpoint = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
+
     if not isinstance(checkpoint, dict) or "model_state" not in checkpoint:
         raise ValueError(f"Invalid checkpoint format: {checkpoint_path}")
     return checkpoint
