@@ -1,6 +1,6 @@
 import { createSlice } from '@reduxjs/toolkit'
 import type { PayloadAction } from '@reduxjs/toolkit'
-import type { Prediction } from '../../../types'
+import type { Draft, Prediction } from '../../../types'
 
 export interface PredictionState {
   prediction: Prediction | null
@@ -16,10 +16,14 @@ export const predictionSlice = createSlice({
   reducers: {
     setPrediction: (state, action: PayloadAction<Prediction>) => {
       state.prediction = action.payload
+    },
+
+    addDraft: (state, action: PayloadAction<Draft>) => {
+      state.prediction?.drafts.push(action.payload)
     }
   },
 })
 
-export const { setPrediction } = predictionSlice.actions
+export const { setPrediction, addDraft } = predictionSlice.actions
 
 export default predictionSlice.reducer
