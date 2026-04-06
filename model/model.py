@@ -8,6 +8,8 @@ import importlib
 import itertools
 import json
 import os
+import re
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib import error as urllib_error
@@ -106,6 +108,7 @@ class PipelineSettings:
     openrouter_timeout_sec: float = 30.0
     openrouter_site_url: Optional[str] = None
     openrouter_app_name: str = "purple-avito-hackaton"
+    normalize_text: bool = True
 
 
 @dataclass
@@ -139,6 +142,20 @@ def _parse_int_list(raw_value: Any) -> List[int]:
 
     parts = [p.strip() for p in text.replace(";", ",").split(",")]
     return [int(p) for p in parts if p and p.isdigit()]
+
+
+def _normalize_text_content(text: str) -> str:
+    """Normalize noisy user-generated text while preserving semantics."""
+    if not text:
+        return ""
+
+    cleaned = unicodedata.normalize("NFKC", str(text))
+    cleaned = cleaned.replace("\u00A0", " ")
+    cleaned = re.sub(r"[\r\n\t]+", " ", cleaned)
+    # Remove most emoji and pictographic symbols that add noise for retrieval/encoder.
+    cleaned = re.sub(r"[\U0001F300-\U0001FAFF\U00002700-\U000027BF\U000024C2-\U0001F251]", " ", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned
 
 
 def load_microcategories_from_csv(csv_path: str) -> List[MicroCategory]:
@@ -394,6 +411,7 @@ class DraftSplitPipeline:
                 openrouter_timeout_sec: float = 30.0,
                 openrouter_site_url: Optional[str] = None,
                 openrouter_app_name: str = "purple-avito-hackaton",
+                    normalize_text: bool = True,
             settings: Optional[PipelineSettings] = None,
     ) -> None:
         _require_torch()
@@ -421,6 +439,7 @@ class DraftSplitPipeline:
             openrouter_timeout_sec = settings.openrouter_timeout_sec
             openrouter_site_url = settings.openrouter_site_url
             openrouter_app_name = settings.openrouter_app_name
+            normalize_text = settings.normalize_text
 
         self.id_to_title = {mc.mc_id: mc.mc_title for mc in self.microcategories}
         self.id_to_idx = {mc.mc_id: i for i, mc in enumerate(self.microcategories)}
@@ -455,9 +474,15 @@ class DraftSplitPipeline:
         self.openrouter_site_url = openrouter_site_url
         self.openrouter_app_name = str(openrouter_app_name)
         self.openrouter_api_key = openrouter_api_key or os.getenv("OPENROUTER_API_KEY")
+        self.normalize_text = bool(normalize_text)
         self.llm_success_count = 0
         self.llm_fallback_count = 0
         self.last_llm_error: Optional[str] = None
+
+    def _prepare_text(self, text: str) -> str:
+        if not self.normalize_text:
+            return " ".join(str(text).strip().split())
+        return _normalize_text_content(text)
 
     def train_step(
             self,
@@ -507,13 +532,14 @@ class DraftSplitPipeline:
             if not candidates:
                 continue
             candidates_unique = list(dict.fromkeys(candidates))
+            prepared_text = self._prepare_text(text)
 
             cand_indices = torch.tensor(
                 [self.id_to_idx[mc_id] for mc_id in candidates_unique],
                 dtype=torch.long,
                 device=self.device,
             )
-            text_emb = self.model.encode_text([text], self.device)
+            text_emb = self.model.encode_text([prepared_text], self.device)
             logits = self.model(text_emb, cand_indices).squeeze(0)
             target_distribution = build_target_distribution(candidates_unique, target_mc_list, source_mc_id)
             loss = nn.functional.kl_div(
@@ -665,6 +691,7 @@ class DraftSplitPipeline:
         if not candidate_mc_ids:
             return {}
 
+        prepared_description = self._prepare_text(description)
         self.model.eval()
         with torch.no_grad():
             cand_indices = torch.tensor(
@@ -672,7 +699,7 @@ class DraftSplitPipeline:
                 dtype=torch.long,
                 device=self.device,
             )
-            text_emb = self.model.encode_text([description], self.device)
+            text_emb = self.model.encode_text([prepared_description], self.device)
             logits = self.model(text_emb, cand_indices).squeeze(0)
             probs = torch.softmax(logits, dim=-1).detach().cpu().numpy()
             return {mc_id: float(prob) for mc_id, prob in zip(candidate_mc_ids, probs)}
@@ -846,13 +873,14 @@ class DraftSplitPipeline:
         }
 
     def predict(self, item: Item) -> PredictionResult:
-        detected, tfidf_scores = self.retriever.detect(item.description)
+        prepared_description = self._prepare_text(item.description)
+        detected, tfidf_scores = self.retriever.detect(prepared_description)
         detected_wo_source = [mc_id for mc_id in detected if mc_id != item.mc_id]
-        prob_map = self.score_candidates(item.description, detected_wo_source)
+        prob_map = self.score_candidates(prepared_description, detected_wo_source)
         blended_scores = self._blend_scores(prob_map, tfidf_scores, detected_wo_source)
         self.model.eval()
         with torch.no_grad():
-            text_emb = self.model.encode_text([item.description], self.device)
+            text_emb = self.model.encode_text([prepared_description], self.device)
             split_prob = torch.sigmoid(self.model.split_logits(text_emb).view(-1)).item()
 
         selected = [
@@ -870,7 +898,7 @@ class DraftSplitPipeline:
             Draft(
                 mc_id=mc_id,
                 mc_title=self.id_to_title[mc_id],
-                text=self._generate_draft_text(self.id_to_title[mc_id], item.description),
+                text=self._generate_draft_text(self.id_to_title[mc_id], prepared_description),
             )
             for mc_id in target_mc_ids
         ]

@@ -47,6 +47,12 @@ DEFAULT_THRESHOLD_GRID: tuple[float, ...] = (0.08, 0.12, 0.16, 0.20, 0.24)
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train and evaluate the Avito split-draft pipeline.")
     parser.add_argument("--data-dir", type=Path, default=Path(__file__).resolve().parent / "data")
+    parser.add_argument(
+        "--dataset-file",
+        type=Path,
+        default=None,
+        help="Optional dataset file path (csv/jsonl). Relative paths are resolved against --data-dir.",
+    )
     parser.add_argument("--transformer-name", type=str, default="DeepPavlov/rubert-base-cased")
     parser.add_argument("--tfidf-threshold", type=float, default=0.03)
     parser.add_argument("--tfidf-top-k", type=int, default=11)
@@ -72,6 +78,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--patience", type=int, default=2)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument(
+        "--max-length",
+        type=int,
+        default=384,
+        help="Max token length for transformer encoder (recommended 384 for 8GB GPU).",
+    )
+    parser.add_argument(
+        "--disable-text-normalization",
+        action="store_true",
+        help="Disable text normalization (emoji/symbol cleanup and whitespace normalization).",
+    )
     parser.add_argument(
         "--split-threshold-grid",
         type=float,
@@ -190,7 +207,19 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_items(data_dir: Path, use_jsonl: bool) -> List[object]:
+def load_items(data_dir: Path, use_jsonl: bool, dataset_file: Path | None = None) -> List[object]:
+    if dataset_file is not None:
+        dataset_path = dataset_file if dataset_file.is_absolute() else data_dir / dataset_file
+        suffix = dataset_path.suffix.lower()
+        if suffix == ".jsonl":
+            return load_labeled_items_jsonl(str(dataset_path))
+        if suffix == ".csv":
+            return load_labeled_items_csv(str(dataset_path))
+        # Fallback for files without extension: use --use-jsonl toggle.
+        if use_jsonl:
+            return load_labeled_items_jsonl(str(dataset_path))
+        return load_labeled_items_csv(str(dataset_path))
+
     dataset_path = data_dir / ("rnc_dataset.jsonl" if use_jsonl else "rnc_dataset.csv")
     if use_jsonl:
         return load_labeled_items_jsonl(str(dataset_path))
@@ -271,7 +300,7 @@ def main() -> None:
     print(f"Loading microcategories from {micro_path}...")
     microcategories = load_microcategories_from_csv(str(micro_path))
     print(f"Loading dataset ({dataset_label}) from {data_dir}...")
-    items = load_items(data_dir, args.use_jsonl)
+    items = load_items(data_dir, args.use_jsonl, args.dataset_file)
     buckets = split_dataset(items)
 
     train_items = buckets.get("train", [])
@@ -293,6 +322,7 @@ def main() -> None:
         score_margin=float(checkpoint_config.get("score_margin", args.score_margin)),
         relative_ratio=float(checkpoint_config.get("relative_ratio", args.relative_ratio)),
         score_blend_alpha=float(checkpoint_config.get("score_blend_alpha", args.score_blend_alpha)),
+        max_length=int(checkpoint_config.get("max_length", args.max_length)),
         device=args.device,
         use_llm_drafts=use_llm_drafts,
         openrouter_model=str(args.openrouter_model),
@@ -301,6 +331,7 @@ def main() -> None:
         openrouter_timeout_sec=float(args.openrouter_timeout_sec),
         openrouter_site_url=args.openrouter_site_url,
         openrouter_app_name=str(args.openrouter_app_name),
+        normalize_text=bool(checkpoint_config.get("normalize_text", not args.disable_text_normalization)),
     )
     training_settings = TrainingSettings(
         epochs=args.epochs,
@@ -456,6 +487,7 @@ def main() -> None:
             "score_margin": pipeline.score_margin,
             "relative_ratio": pipeline.relative_ratio,
             "score_blend_alpha": pipeline.score_blend_alpha,
+            "max_length": args.max_length,
             "class_prob_thresholds": pipeline.class_prob_thresholds,
             "use_llm_drafts": llm_requested,
             "openrouter_model": pipeline.openrouter_model,
@@ -463,6 +495,7 @@ def main() -> None:
             "openrouter_timeout_sec": pipeline.openrouter_timeout_sec,
             "openrouter_site_url": pipeline.openrouter_site_url,
             "openrouter_app_name": pipeline.openrouter_app_name,
+            "normalize_text": pipeline.normalize_text,
         }
 
         print(f"\nSaving model checkpoint to {model_checkpoint_path}...")
