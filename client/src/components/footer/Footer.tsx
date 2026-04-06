@@ -7,7 +7,7 @@ const Footer: React.FC<PropsType> = (): JSX.Element => {
     return (
         <footer className="page-footer">
             <div className="page-footer__container container">
-                <p className="page-footer__text">Workspace UI for ad split operations. Semantic HTML, BEM naming, SCSS modules.</p>
+                <p className="page-footer__text">Интерфейс для операций разбиения объявлений. Семантическая HTML-разметка, нейминг BEM, SCSS-модули.</p>
             </div>
         </footer>
     )

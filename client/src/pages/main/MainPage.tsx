@@ -17,7 +17,7 @@ const MainPage: React.FC<PropsType> = (): JSX.Element => {
                         Введите текст, выберите исходную категорию и запустите анализ.
                     </p>
                     </div>
-                    <div className="workspace__status" aria-label="Model status">
+                    <div className="workspace__status" aria-label="Статус модели">
                     <span className="workspace__status-dot"></span>
                     Модель: TF-IDF (2-3 grams) + Transformer Softmax
                     </div>
@@ -30,11 +30,11 @@ const MainPage: React.FC<PropsType> = (): JSX.Element => {
                         <div className="ad-form__field">
                         <label className="ad-form__label" htmlFor="ad-source">Исходная категория</label>
                         <select className="ad-form__control" id="ad-source" name="source">
-                            <option>101 - Turnkey Renovation</option>
-                            <option>102 - Plumbing</option>
-                            <option>103 - Electrical</option>
-                            <option>104 - Stretch Ceilings</option>
-                            <option>105 - Tile Laying</option>
+                            <option>101 - Ремонт под ключ</option>
+                            <option>102 - Сантехника</option>
+                            <option>103 - Электрика</option>
+                            <option>104 - Натяжные потолки</option>
+                            <option>105 - Укладка плитки</option>
                         </select>
                         </div>
 
@@ -67,15 +67,15 @@ const MainPage: React.FC<PropsType> = (): JSX.Element => {
                     <article className="result-card">
                         <h3 className="result-card__title">Найденные микрокатегории</h3>
                         <ul className="result-card__chips">
-                        <li className="result-card__chip">102 Plumbing</li>
-                        <li className="result-card__chip">103 Electrical</li>
-                        <li className="result-card__chip">105 Tile Laying</li>
+                        <li className="result-card__chip">102 Сантехника</li>
+                        <li className="result-card__chip">103 Электрика</li>
+                        <li className="result-card__chip">105 Укладка плитки</li>
                         </ul>
                     </article>
 
                     <article className="result-card">
                         <h3 className="result-card__title">Следует разделить?</h3>
-                        <p className="result-card__decision result-card__decision--yes">shouldSplit: true</p>
+                        <p className="result-card__decision result-card__decision--yes">Нужно разделить: да</p>
                         <p className="result-card__text">3 микрокатегории превысили порог и отличны от исходной категории</p>
                     </article>
 
@@ -83,11 +83,11 @@ const MainPage: React.FC<PropsType> = (): JSX.Element => {
                         <h3 className="result-card__title">Пример черновика</h3>
                         <ul className="result-card__drafts">
                         <li className="result-card__draft">
-                            <h4 className="result-card__draft-title">102 Plumbing</h4>
+                            <h4 className="result-card__draft-title">102 Сантехника</h4>
                             <p className="result-card__draft-text">Выполняем сантехнические работы отдельно: разводка труб, установка сантехники, замена смесителей.</p>
                         </li>
                         <li className="result-card__draft">
-                            <h4 className="result-card__draft-title">103 Electrical</h4>
+                            <h4 className="result-card__draft-title">103 Электрика</h4>
                             <p className="result-card__draft-text">Отдельно делаем электромонтаж: замена проводки, перенос розеток и установка освещения.</p>
                         </li>
                         </ul>
@@ -100,9 +100,9 @@ const MainPage: React.FC<PropsType> = (): JSX.Element => {
                     <article className="side-card">
                         <h3 className="side-card__title">Недавние сессии</h3>
                         <ul className="side-card__list">
-                        <li className="side-card__item">Item 5001 - split true</li>
-                        <li className="side-card__item">Item 5002 - split false</li>
-                        <li className="side-card__item">Item 5003 - split true</li>
+                        <li className="side-card__item">Объявление 5001 - разделение: да</li>
+                        <li className="side-card__item">Объявление 5002 - разделение: нет</li>
+                        <li className="side-card__item">Объявление 5003 - разделение: да</li>
                         </ul>
                     </article>
 
@@ -116,7 +116,7 @@ const MainPage: React.FC<PropsType> = (): JSX.Element => {
 
                     <article className="side-card">
                         <h3 className="side-card__title">Страницы проекта</h3>
-                        <nav className="side-card__links" aria-label="Secondary">
+                        <nav className="side-card__links" aria-label="Дополнительная навигация">
                         <Link className="side-card__link" to="/project">Показ пайплайна</Link>
                         <Link className="side-card__link" to="/dataset">Структура датасета</Link>
                         <Link className="side-card__link" to="/metrics">Метрики</Link>

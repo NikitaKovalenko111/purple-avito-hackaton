@@ -9,54 +9,54 @@ const DatasetPage: React.FC<PropsType> = (): JSX.Element => {
             <section className="info" aria-labelledby="info-title-dataset">
                 <div className="info__container container">
                 <header className="info__head">
-                    <p className="info__eyebrow">Dataset Documentation</p>
-                    <h1 className="info__title" id="info-title-dataset">Synthetic benchmark details</h1>
+                    <p className="info__eyebrow">Документация датасета</p>
+                    <h1 className="info__title" id="info-title-dataset">Детали синтетического бенчмарка</h1>
                 </header>
 
                 <div className="stat-grid">
                     <article className="stat-card">
-                    <p className="stat-card__label">Rows</p>
+                    <p className="stat-card__label">Строк</p>
                     <p className="stat-card__value">3,000</p>
                     </article>
                     <article className="stat-card">
-                    <p className="stat-card__label">Microcategories</p>
+                    <p className="stat-card__label">Микрокатегорий</p>
                     <p className="stat-card__value">11</p>
                     </article>
                     <article className="stat-card">
-                    <p className="stat-card__label">Split=True share</p>
+                    <p className="stat-card__label">Доля split=True</p>
                     <p className="stat-card__value">37.1%</p>
                     </article>
                 </div>
 
                 <section className="table-block" aria-labelledby="table-title">
-                    <h2 className="table-block__title" id="table-title">Core columns</h2>
+                    <h2 className="table-block__title" id="table-title">Основные колонки</h2>
                     <table className="table-block__table">
                     <thead>
                         <tr>
-                        <th>Field</th>
-                        <th>Description</th>
+                        <th>Поле</th>
+                        <th>Описание</th>
                         </tr>
                     </thead>
                     <tbody>
                         <tr>
                         <td>description</td>
-                        <td>Listing text used for detection and split decision</td>
+                        <td>Текст объявления для детекции и решения о разделении</td>
                         </tr>
                         <tr>
                         <td>targetDetectedMcIds</td>
-                        <td>All microcategories present in text</td>
+                        <td>Все микрокатегории, присутствующие в тексте</td>
                         </tr>
                         <tr>
                         <td>targetSplitMcIds</td>
-                        <td>Microcategories for additional draft creation</td>
+                        <td>Микрокатегории для создания дополнительных черновиков</td>
                         </tr>
                         <tr>
                         <td>shouldSplit</td>
-                        <td>Binary decision flag for draft creation</td>
+                        <td>Бинарный флаг необходимости создания черновиков</td>
                         </tr>
                         <tr>
                         <td>split</td>
-                        <td>train, val, test partition</td>
+                        <td>Разделение на train, val, test</td>
                         </tr>
                     </tbody>
                     </table>

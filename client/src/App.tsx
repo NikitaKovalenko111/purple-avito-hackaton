@@ -9,14 +9,14 @@ import DatasetPage from './pages/dataset/DatasetPage'
 
 function App() {
   return (
-      <html lang="en">
+      <html lang="ru">
         <head>
           <meta charSet="UTF-8" />
           <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-          <title>Service Split Assistant Workspace</title>
+          <title>Рабочая панель</title>
           <meta
             name="description"
-            content="Work panel for ad analysis, split decisions, and draft preparation."
+            content="Рабочая панель для анализа объявлений, принятия решений о разделении и подготовки черновиков."
           />
           <link rel="stylesheet" href="styles/main.css" />
         </head>
