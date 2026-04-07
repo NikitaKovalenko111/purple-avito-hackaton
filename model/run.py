@@ -72,17 +72,59 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Blend weight for model score vs TF-IDF score (1.0 = model-only).",
     )
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=3e-5)
     parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--patience", type=int, default=2)
+    parser.add_argument("--patience", type=int, default=3)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument(
         "--max-length",
         type=int,
-        default=384,
+        default=512,
         help="Max token length for transformer encoder (recommended 384 for 8GB GPU).",
+    )
+    parser.add_argument(
+        "--long-text-mode",
+        type=str,
+        choices=["head", "head_tail", "chunks"],
+        default="chunks",
+        help="Strategy for long ads: head truncation, head+tail, or chunk windows.",
+    )
+    parser.add_argument(
+        "--long-text-window-tokens",
+        type=int,
+        default=256,
+        help="Chunk window size in tokens for --long-text-mode chunks.",
+    )
+    parser.add_argument(
+        "--long-text-stride-tokens",
+        type=int,
+        default=192,
+        help="Chunk stride in tokens for --long-text-mode chunks.",
+    )
+    parser.add_argument(
+        "--long-text-max-windows",
+        type=int,
+        default=4,
+        help="Max windows per text for --long-text-mode chunks.",
+    )
+    parser.add_argument(
+        "--use-cross-encoder",
+        action="store_true",
+        help="Enable cross-encoder reranking on shortlisted candidates.",
+    )
+    parser.add_argument(
+        "--cross-encoder-alpha",
+        type=float,
+        default=0.5,
+        help="Blend weight for cross-encoder reranking scores.",
+    )
+    parser.add_argument(
+        "--cross-encoder-loss-weight",
+        type=float,
+        default=0.5,
+        help="Loss weight for cross-encoder pairwise training.",
     )
     parser.add_argument(
         "--disable-text-normalization",
@@ -90,52 +132,94 @@ def parse_args() -> argparse.Namespace:
         help="Disable text normalization (emoji/symbol cleanup and whitespace normalization).",
     )
     parser.add_argument(
+        "--noise-min-words",
+        type=int,
+        default=3,
+        help="Drop short noisy sentences with fewer than N words.",
+    )
+    parser.add_argument(
+        "--noise-min-unique-ratio",
+        type=float,
+        default=0.5,
+        help="Drop noisy sentences with low unique-word ratio.",
+    )
+    parser.add_argument(
+        "--disable-collapse-repeated-words",
+        action="store_true",
+        help="Disable collapsing repeated neighboring words like 'доставка доставка доставка'.",
+    )
+    parser.add_argument(
+        "--sentence-head-count",
+        type=int,
+        default=1,
+        help="Always keep first N informative sentences.",
+    )
+    parser.add_argument(
+        "--sentence-tail-count",
+        type=int,
+        default=1,
+        help="Always keep last N informative sentences.",
+    )
+    parser.add_argument(
+        "--sentence-top-k",
+        type=int,
+        default=3,
+        help="Keep top-K additional informative sentences by heuristic score.",
+    )
+    parser.add_argument(
         "--split-threshold-grid",
         type=float,
         nargs="+",
-        default=[0.35, 0.40, 0.45, 0.50, 0.55, 0.60],
+        default=[0.30, 0.35, 0.40, 0.45, 0.50],
         help="Candidate shouldSplit thresholds to search on validation.",
     )
     parser.add_argument(
         "--threshold-grid",
         type=float,
         nargs="+",
-        default=list(DEFAULT_THRESHOLD_GRID),
+        default=[0.03, 0.04, 0.05, 0.06, 0.08, 0.10],
         help="Candidate probability thresholds to search on validation.",
     )
     parser.add_argument(
         "--class-threshold-grid",
         type=float,
         nargs="+",
-        default=list(DEFAULT_THRESHOLD_GRID),
+        default=[0.03, 0.04, 0.05, 0.06, 0.08],
         help="Candidate per-class probability thresholds to search on validation.",
     )
     parser.add_argument(
         "--max-drafts-grid",
         type=int,
         nargs="+",
-        default=[0, 2, 3],
+        default=[0, 3, 5, 7],
         help="Grid for max generated drafts (0 = no cap).",
+    )
+    parser.add_argument(
+        "--top-k-drafts-grid",
+        type=int,
+        nargs="+",
+        default=[3, 5, 7],
+        help="Grid for top-k candidate selection before reranking filters.",
     )
     parser.add_argument(
         "--score-margin-grid",
         type=float,
         nargs="+",
-        default=[1.0, 0.20, 0.12, 0.08],
+        default=[0.30, 0.20, 0.12],
         help="Grid for absolute margin filtering from the top score.",
     )
     parser.add_argument(
         "--relative-ratio-grid",
         type=float,
         nargs="+",
-        default=[0.0, 0.5, 0.7],
+        default=[0.4, 0.6],
         help="Grid for relative top-score ratio filtering.",
     )
     parser.add_argument(
         "--score-blend-alpha-grid",
         type=float,
         nargs="+",
-        default=[1.0, 0.9, 0.8],
+        default=[1.0, 0.9],
         help="Grid for blending transformer and TF-IDF scores.",
     )
     parser.add_argument(
@@ -147,7 +231,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--min-recall",
         type=float,
-        default=0.0,
+        default=0.45,
         help="Minimum recall constraint during validation searches.",
     )
     parser.add_argument("--use-jsonl", action="store_true", help="Load dataset from JSONL instead of CSV.")
@@ -203,6 +287,17 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path(__file__).resolve().parent / "checkpoints",
         help="Directory to save model checkpoints and results.",
+    )
+    parser.add_argument(
+        "--split-pos-weight",
+        type=float,
+        default=1.8,
+        help="Positive class weight for shouldSplit BCE loss (>1 increases split recall).",
+    )
+    parser.add_argument(
+        "--no-early-stopping",
+        action="store_true",
+        help="Train for all epochs without validation-based early stopping.",
     )
     return parser.parse_args()
 
@@ -323,6 +418,22 @@ def main() -> None:
         relative_ratio=float(checkpoint_config.get("relative_ratio", args.relative_ratio)),
         score_blend_alpha=float(checkpoint_config.get("score_blend_alpha", args.score_blend_alpha)),
         max_length=int(checkpoint_config.get("max_length", args.max_length)),
+        long_text_mode=str(checkpoint_config.get("long_text_mode", args.long_text_mode)),
+        long_text_window_tokens=int(
+            checkpoint_config.get("long_text_window_tokens", args.long_text_window_tokens)
+        ),
+        long_text_stride_tokens=int(
+            checkpoint_config.get("long_text_stride_tokens", args.long_text_stride_tokens)
+        ),
+        long_text_max_windows=int(
+            checkpoint_config.get("long_text_max_windows", args.long_text_max_windows)
+        ),
+        top_k_drafts=int(checkpoint_config.get("top_k_drafts", 5)),
+        use_cross_encoder=bool(checkpoint_config.get("use_cross_encoder", args.use_cross_encoder)),
+        cross_encoder_alpha=float(checkpoint_config.get("cross_encoder_alpha", args.cross_encoder_alpha)),
+        cross_encoder_loss_weight=float(
+            checkpoint_config.get("cross_encoder_loss_weight", args.cross_encoder_loss_weight)
+        ),
         device=args.device,
         use_llm_drafts=use_llm_drafts,
         openrouter_model=str(args.openrouter_model),
@@ -332,6 +443,16 @@ def main() -> None:
         openrouter_site_url=args.openrouter_site_url,
         openrouter_app_name=str(args.openrouter_app_name),
         normalize_text=bool(checkpoint_config.get("normalize_text", not args.disable_text_normalization)),
+        noise_min_words=int(checkpoint_config.get("noise_min_words", args.noise_min_words)),
+        noise_min_unique_ratio=float(
+            checkpoint_config.get("noise_min_unique_ratio", args.noise_min_unique_ratio)
+        ),
+        collapse_repeated_words=bool(
+            checkpoint_config.get("collapse_repeated_words", not args.disable_collapse_repeated_words)
+        ),
+        sentence_head_count=int(checkpoint_config.get("sentence_head_count", args.sentence_head_count)),
+        sentence_tail_count=int(checkpoint_config.get("sentence_tail_count", args.sentence_tail_count)),
+        sentence_top_k=int(checkpoint_config.get("sentence_top_k", args.sentence_top_k)),
     )
     training_settings = TrainingSettings(
         epochs=args.epochs,
@@ -339,7 +460,12 @@ def main() -> None:
         lr=args.lr,
         weight_decay=args.weight_decay,
         patience=args.patience,
+        split_pos_weight=float(args.split_pos_weight),
         threshold_grid=tuple(args.threshold_grid),
+        split_threshold_grid=tuple(args.split_threshold_grid),
+        optimize_for=args.optimize_for,
+        min_recall=float(args.min_recall),
+        cross_encoder_loss_weight=float(args.cross_encoder_loss_weight),
     )
 
     pipeline = DraftSplitPipeline(
@@ -371,15 +497,29 @@ def main() -> None:
     if checkpoint_mode:
         print("Skipping training because --checkpoint-path is provided.")
     elif train_items and val_items:
-        print("Training with early stopping...")
-        fit_report = pipeline.fit_with_early_stopping(
-            train_items=train_items,
-            val_items=val_items,
-            optimizer=optimizer,
-            training_settings=training_settings,
-        )
-        print("Training report:")
-        print(json.dumps(fit_report, ensure_ascii=False, indent=2))
+        if args.no_early_stopping:
+            print("Training without early stopping...")
+            losses = pipeline.train_on_labeled_items(
+                items=train_items,
+                optimizer=optimizer,
+                batch_size=training_settings.batch_size,
+                epochs=training_settings.epochs,
+                split_loss_weight=training_settings.split_loss_weight,
+                split_pos_weight=training_settings.split_pos_weight,
+                cross_encoder_loss_weight=training_settings.cross_encoder_loss_weight,
+                verbose=True,
+            )
+            print(f"Loss history: {losses}")
+        else:
+            print("Training with early stopping...")
+            fit_report = pipeline.fit_with_early_stopping(
+                train_items=train_items,
+                val_items=val_items,
+                optimizer=optimizer,
+                training_settings=training_settings,
+            )
+            print("Training report:")
+            print(json.dumps(fit_report, ensure_ascii=False, indent=2))
     elif train_items:
         print("Training without validation set...")
         losses = pipeline.train_on_labeled_items(
@@ -387,6 +527,11 @@ def main() -> None:
             optimizer=optimizer,
             batch_size=training_settings.batch_size,
             epochs=training_settings.epochs,
+            split_loss_weight=training_settings.split_loss_weight,
+            split_pos_weight=training_settings.split_pos_weight,
+            # cross-encoder loss is handled inside train_step through pipeline settings
+            # cross-encoder loss is handled inside train_step through pipeline settings
+            verbose=True,
         )
         print(f"Loss history: {losses}")
     else:
@@ -408,7 +553,13 @@ def main() -> None:
         print(json.dumps(threshold_report, ensure_ascii=False, indent=2))
         pipeline.prob_threshold = threshold_report["threshold"]
 
-        split_threshold_report = evaluate_split_probability_threshold(pipeline, val_items, args.split_threshold_grid)
+        split_threshold_report = evaluate_split_probability_threshold(
+            pipeline,
+            val_items,
+            args.split_threshold_grid,
+            optimize_for=args.optimize_for,
+            min_recall=args.min_recall,
+        )
         print("Validation split-threshold tuning:")
         print(json.dumps(split_threshold_report, ensure_ascii=False, indent=2))
         pipeline.split_threshold = split_threshold_report["threshold"]
@@ -428,6 +579,7 @@ def main() -> None:
         reranking_report = search_best_reranking_controls(
             pipeline,
             val_items,
+            args.top_k_drafts_grid,
             args.max_drafts_grid,
             args.score_margin_grid,
             args.relative_ratio_grid,
@@ -488,6 +640,14 @@ def main() -> None:
             "relative_ratio": pipeline.relative_ratio,
             "score_blend_alpha": pipeline.score_blend_alpha,
             "max_length": args.max_length,
+            "long_text_mode": pipeline.model.long_text_mode,
+            "long_text_window_tokens": pipeline.model.long_text_window_tokens,
+            "long_text_stride_tokens": pipeline.model.long_text_stride_tokens,
+            "long_text_max_windows": pipeline.model.long_text_max_windows,
+            "top_k_drafts": pipeline.top_k_drafts,
+            "use_cross_encoder": pipeline.use_cross_encoder,
+            "cross_encoder_alpha": pipeline.cross_encoder_alpha,
+            "cross_encoder_loss_weight": pipeline.cross_encoder_loss_weight,
             "class_prob_thresholds": pipeline.class_prob_thresholds,
             "use_llm_drafts": llm_requested,
             "openrouter_model": pipeline.openrouter_model,
@@ -496,6 +656,12 @@ def main() -> None:
             "openrouter_site_url": pipeline.openrouter_site_url,
             "openrouter_app_name": pipeline.openrouter_app_name,
             "normalize_text": pipeline.normalize_text,
+            "noise_min_words": pipeline.noise_min_words,
+            "noise_min_unique_ratio": pipeline.noise_min_unique_ratio,
+            "collapse_repeated_words": pipeline.collapse_repeated_words,
+            "sentence_head_count": pipeline.sentence_head_count,
+            "sentence_tail_count": pipeline.sentence_tail_count,
+            "sentence_top_k": pipeline.sentence_top_k,
         }
 
         print(f"\nSaving model checkpoint to {model_checkpoint_path}...")
