@@ -145,6 +145,7 @@ class PipelineSettings:
     use_cross_encoder: bool = False
     cross_encoder_alpha: float = 0.5
     cross_encoder_loss_weight: float = 0.5
+    split_equals_detected_when_should_split: bool = False
 
 
 @dataclass
@@ -154,7 +155,7 @@ class TrainingSettings:
     lr: float = 3e-5
     weight_decay: float = 0.01
     split_loss_weight: float = 0.5
-    split_pos_weight: float = 1.0
+    split_pos_weight: float = 5.0
     patience: int = 2
     min_delta: float = 1e-4
     threshold_grid: Tuple[float, ...] = (0.08, 0.12, 0.16, 0.20, 0.24)
@@ -674,6 +675,7 @@ class DraftSplitPipeline:
                 sentence_tail_count: int = 1,
                 sentence_top_k: int = 7,
                 split_keyword_phrases: Optional[Sequence[str]] = None,
+                split_equals_detected_when_should_split: bool = False,
             settings: Optional[PipelineSettings] = None,
     ) -> None:
         _require_torch()
@@ -718,6 +720,7 @@ class DraftSplitPipeline:
             sentence_top_k = settings.sentence_top_k
             split_target_mode = settings.split_target_mode
             split_keyword_phrases = settings.split_keyword_phrases
+            split_equals_detected_when_should_split = settings.split_equals_detected_when_should_split
 
         self.id_to_title = {mc.mc_id: mc.mc_title for mc in self.microcategories}
         self.id_to_idx = {mc.mc_id: i for i, mc in enumerate(self.microcategories)}
@@ -772,6 +775,7 @@ class DraftSplitPipeline:
             for phrase in (split_keyword_phrases or ())
             if str(phrase).strip()
         )
+        self.split_equals_detected_when_should_split = bool(split_equals_detected_when_should_split)
         self.top_k_drafts = max(0, int(top_k_drafts))
         self.use_cross_encoder = bool(use_cross_encoder)
         self.cross_encoder_alpha = min(1.0, max(0.0, float(cross_encoder_alpha)))
@@ -900,7 +904,7 @@ class DraftSplitPipeline:
             source_mc_ids: Sequence[int],
             optimizer: Any,
             split_loss_weight: float = 0.5,
-            split_pos_weight: float = 1.0,
+            split_pos_weight: float = 5.0,
                 cross_encoder_loss_weight: float = 0.5,
     ) -> float:
         if (
@@ -1010,8 +1014,10 @@ class DraftSplitPipeline:
             epochs: int = 1,
             force_include_targets: bool = False,
             split_loss_weight: float = 0.5,
-            split_pos_weight: float = 1.0,
+            split_pos_weight: float = 5.0,
             cross_encoder_loss_weight: float = 0.5,
+            log_epoch: Optional[int] = None,
+            log_total_epochs: Optional[int] = None,
             verbose: bool = False,
     ) -> List[float]:
         history: List[float] = []
@@ -1021,6 +1027,8 @@ class DraftSplitPipeline:
         total_steps = (len(items) + batch_size - 1) // batch_size if items else 0
         for _ in range(epochs):
             epoch_index = len(history) + 1
+            display_epoch = log_epoch if log_epoch is not None else epoch_index
+            display_total_epochs = log_total_epochs if log_total_epochs is not None else epochs
             epoch_loss = 0.0
             steps = 0
             for i in range(0, len(items), batch_size):
@@ -1053,7 +1061,7 @@ class DraftSplitPipeline:
                     avg_loss = epoch_loss / max(steps, 1)
                     progress = (steps / total_steps) * 100.0
                     print(
-                        f"Epoch {epoch_index}/{epochs} | "
+                        f"Epoch {display_epoch}/{display_total_epochs} | "
                         f"step {steps}/{total_steps} ({progress:5.1f}%) | "
                         f"avg_loss={avg_loss:.4f}",
                         end="\r",
@@ -1064,7 +1072,7 @@ class DraftSplitPipeline:
             if verbose:
                 if total_steps > 0:
                     print()
-                print(f"Epoch {epoch_index}/{epochs} | train_loss={epoch_avg_loss:.4f}")
+                print(f"Epoch {display_epoch}/{display_total_epochs} | train_loss={epoch_avg_loss:.4f}")
         return history
 
     def fit_with_early_stopping(
@@ -1093,6 +1101,8 @@ class DraftSplitPipeline:
                 split_loss_weight=settings.split_loss_weight,
                 split_pos_weight=settings.split_pos_weight,
                 cross_encoder_loss_weight=settings.cross_encoder_loss_weight,
+                log_epoch=epoch,
+                log_total_epochs=settings.epochs,
                 verbose=verbose,
             )
             loss_value = loss_history[-1] if loss_history else 0.0
@@ -1374,11 +1384,20 @@ class DraftSplitPipeline:
         ]
         selected.sort(key=lambda x: x[1], reverse=True)
         target_mc_ids = self._apply_reranking_controls(selected)
-        should_split = split_prob >= self.split_threshold
+        candidate_support = 0.0
+        if target_mc_ids:
+            top_candidate_score = max(float(score) for _, score in selected[: max(1, len(target_mc_ids))])
+            candidate_density = min(1.0, len(target_mc_ids) / 4.0)
+            candidate_support = max(top_candidate_score, candidate_density)
+
+        split_score = 0.75 * split_prob + 0.25 * candidate_support
+        should_split = split_score >= self.split_threshold
         if not should_split:
             target_mc_ids = []
+        elif self.split_equals_detected_when_should_split:
+            target_mc_ids = list(dict.fromkeys(detected_wo_source))
 
-        if self.use_cross_encoder and target_mc_ids:
+        if self.use_cross_encoder and target_mc_ids and not self.split_equals_detected_when_should_split:
             candidate_texts = [self.id_to_candidate_text[mc_id] for mc_id in target_mc_ids]
             cross_logits = self.model.cross_logits(
                 [prepared_description] * len(target_mc_ids),
