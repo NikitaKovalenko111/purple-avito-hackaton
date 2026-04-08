@@ -17,8 +17,8 @@ fi
 # chmod +x "$SCRIPTS_DIR/check.sh"
 # bash "$SCRIPTS_DIR/check.sh"
 
-chmod +x "$SCRIPTS_DIR/backend.sh"
-bash "$SCRIPTS_DIR/backend.sh"
+# chmod +x "$SCRIPTS_DIR/backend.sh"
+# bash "$SCRIPTS_DIR/backend.sh"
 
 chmod +x "$SCRIPTS_DIR/frontend.sh"
 bash "$SCRIPTS_DIR/frontend.sh"

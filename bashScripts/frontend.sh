@@ -9,7 +9,7 @@ else
 fi
 
 echo "Запуск клиента..."
-
+cd ./client
 npm run dev
-
+cd ..
 echo "Клиент запущен"
