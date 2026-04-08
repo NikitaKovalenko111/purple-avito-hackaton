@@ -1,31 +1,36 @@
-version: "3.9"
+version: '3.9'
 
 services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+
   backend:
     build: ./backend
-    container_name: django-backend
     restart: unless-stopped
-    environment:
-      - DEBUG=False
-      - DJANGO_ALLOWED_HOSTS=*
-      # Можно добавить другие переменные
+    depends_on:
+      - redis
     volumes:
-      - ./backend/db.sqlite3:/app/db.sqlite3          # ← важно! сохраняем базу
-      - ./backend/static:/app/static                  # для collectstatic
-      - ./backend/media:/app/media                    # если используешь media-файлы
-      - ./models:/app/models:rw
-    command: gunicorn myproject.wsgi:application --bind 0.0.0.0:8000
+      - ./backend:/app
+      - ./db:/app/db
+      - ./model:/app/model
+    expose:
+      - "8000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
 
   nginx:
-    build: ./nginx
-    container_name: nginx-frontend
+    build:
+      context: .
+      dockerfile: nginx/Dockerfile
     restart: unless-stopped
-    ports:
-      - "80:80"          # основной сайт
-      # - "443:443"      # раскомментируй позже для HTTPS
     depends_on:
       - backend
-    volumes:
-      - ./frontend/dist:/usr/share/nginx/html/frontend:ro
-      - ./backend/static:/usr/share/nginx/html/static:ro
-      - ./backend/media:/usr/share/nginx/html/media:ro
+    ports:
+      - "80:80"
+
+volumes:
+  redis_data:
