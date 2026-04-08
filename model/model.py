@@ -154,7 +154,7 @@ class TrainingSettings:
     lr: float = 3e-5
     weight_decay: float = 0.01
     split_loss_weight: float = 0.5
-    split_pos_weight: float = 3.0
+    split_pos_weight: float = 5.0
     patience: int = 2
     min_delta: float = 1e-4
     threshold_grid: Tuple[float, ...] = (0.08, 0.12, 0.16, 0.20, 0.24)
@@ -900,7 +900,7 @@ class DraftSplitPipeline:
             source_mc_ids: Sequence[int],
             optimizer: Any,
             split_loss_weight: float = 0.5,
-            split_pos_weight: float = 3.0,
+            split_pos_weight: float = 5.0,
                 cross_encoder_loss_weight: float = 0.5,
     ) -> float:
         if (
@@ -1010,7 +1010,7 @@ class DraftSplitPipeline:
             epochs: int = 1,
             force_include_targets: bool = False,
             split_loss_weight: float = 0.5,
-            split_pos_weight: float = 3.0,
+            split_pos_weight: float = 5.0,
             cross_encoder_loss_weight: float = 0.5,
             log_epoch: Optional[int] = None,
             log_total_epochs: Optional[int] = None,
@@ -1380,7 +1380,14 @@ class DraftSplitPipeline:
         ]
         selected.sort(key=lambda x: x[1], reverse=True)
         target_mc_ids = self._apply_reranking_controls(selected)
-        should_split = split_prob >= self.split_threshold
+        candidate_support = 0.0
+        if target_mc_ids:
+            top_candidate_score = max(float(score) for _, score in selected[: max(1, len(target_mc_ids))])
+            candidate_density = min(1.0, len(target_mc_ids) / 4.0)
+            candidate_support = max(top_candidate_score, candidate_density)
+
+        split_score = 0.75 * split_prob + 0.25 * candidate_support
+        should_split = split_score >= self.split_threshold
         if not should_split:
             target_mc_ids = []
 
