@@ -145,6 +145,7 @@ class PipelineSettings:
     use_cross_encoder: bool = False
     cross_encoder_alpha: float = 0.5
     cross_encoder_loss_weight: float = 0.5
+    split_equals_detected_when_should_split: bool = False
 
 
 @dataclass
@@ -674,6 +675,7 @@ class DraftSplitPipeline:
                 sentence_tail_count: int = 1,
                 sentence_top_k: int = 7,
                 split_keyword_phrases: Optional[Sequence[str]] = None,
+                split_equals_detected_when_should_split: bool = False,
             settings: Optional[PipelineSettings] = None,
     ) -> None:
         _require_torch()
@@ -718,6 +720,7 @@ class DraftSplitPipeline:
             sentence_top_k = settings.sentence_top_k
             split_target_mode = settings.split_target_mode
             split_keyword_phrases = settings.split_keyword_phrases
+            split_equals_detected_when_should_split = settings.split_equals_detected_when_should_split
 
         self.id_to_title = {mc.mc_id: mc.mc_title for mc in self.microcategories}
         self.id_to_idx = {mc.mc_id: i for i, mc in enumerate(self.microcategories)}
@@ -772,6 +775,7 @@ class DraftSplitPipeline:
             for phrase in (split_keyword_phrases or ())
             if str(phrase).strip()
         )
+        self.split_equals_detected_when_should_split = bool(split_equals_detected_when_should_split)
         self.top_k_drafts = max(0, int(top_k_drafts))
         self.use_cross_encoder = bool(use_cross_encoder)
         self.cross_encoder_alpha = min(1.0, max(0.0, float(cross_encoder_alpha)))
@@ -1390,8 +1394,10 @@ class DraftSplitPipeline:
         should_split = split_score >= self.split_threshold
         if not should_split:
             target_mc_ids = []
+        elif self.split_equals_detected_when_should_split:
+            target_mc_ids = list(dict.fromkeys(detected_wo_source))
 
-        if self.use_cross_encoder and target_mc_ids:
+        if self.use_cross_encoder and target_mc_ids and not self.split_equals_detected_when_should_split:
             candidate_texts = [self.id_to_candidate_text[mc_id] for mc_id in target_mc_ids]
             cross_logits = self.model.cross_logits(
                 [prepared_description] * len(target_mc_ids),

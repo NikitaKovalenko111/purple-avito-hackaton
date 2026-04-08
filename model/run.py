@@ -182,6 +182,11 @@ def parse_args() -> argparse.Namespace:
         help="Which labels to use as the draft target: raw split labels, detected labels, or auto-detect from data.",
     )
     parser.add_argument(
+        "--split-equals-detected-when-should-split",
+        action="store_true",
+        help="If enabled, when shouldSplit=true predicted split categories are set equal to detected categories (excluding source).",
+    )
+    parser.add_argument(
         "--threshold-grid",
         type=float,
         nargs="+",
@@ -494,6 +499,12 @@ def main() -> None:
         sentence_tail_count=int(checkpoint_config.get("sentence_tail_count", args.sentence_tail_count)),
         sentence_top_k=int(checkpoint_config.get("sentence_top_k", args.sentence_top_k)),
         split_target_mode=str(checkpoint_config.get("split_target_mode", split_target_mode)),
+        split_equals_detected_when_should_split=bool(
+            checkpoint_config.get(
+                "split_equals_detected_when_should_split",
+                args.split_equals_detected_when_should_split,
+            )
+        ),
     )
     training_settings = TrainingSettings(
         epochs=args.epochs,
@@ -729,6 +740,7 @@ def main() -> None:
             "sentence_tail_count": pipeline.sentence_tail_count,
             "sentence_top_k": pipeline.sentence_top_k,
             "split_target_mode": pipeline.split_target_mode,
+            "split_equals_detected_when_should_split": pipeline.split_equals_detected_when_should_split,
         }
 
         print(f"\nSaving model checkpoint to {model_checkpoint_path}...")
