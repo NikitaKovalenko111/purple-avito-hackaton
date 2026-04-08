@@ -22,6 +22,7 @@ from model import (
     DraftSplitPipeline,
     PipelineSettings,
     TrainingSettings,
+    evaluate_detect_quality,
     evaluate_retrieval_recall,
     evaluate_split_quality,
     evaluate_split_probability_threshold,
@@ -140,7 +141,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--noise-min-unique-ratio",
         type=float,
-        default=0.5,
+        default=0.35,
         help="Drop noisy sentences with low unique-word ratio.",
     )
     parser.add_argument(
@@ -163,7 +164,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sentence-top-k",
         type=int,
-        default=3,
+        default=7,
         help="Keep top-K additional informative sentences by heuristic score.",
     )
     parser.add_argument(
@@ -283,6 +284,12 @@ def parse_args() -> argparse.Namespace:
         help="Path to saved model checkpoint (.pt). If provided, training is skipped.",
     )
     parser.add_argument(
+        "--init-from-checkpoint",
+        type=Path,
+        default=None,
+        help="Path to checkpoint (.pt) to initialize model weights before training.",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path(__file__).resolve().parent / "checkpoints",
@@ -379,14 +386,22 @@ def main() -> None:
     _load_env_file(project_root / ".env")
 
     args = parse_args()
+    if args.checkpoint_path is not None and args.init_from_checkpoint is not None:
+        raise ValueError("Use either --checkpoint-path or --init-from-checkpoint, not both.")
+
     checkpoint_mode = args.checkpoint_path is not None
     checkpoint: Dict[str, Any] = {}
     checkpoint_config: Dict[str, Any] = {}
+    init_checkpoint: Dict[str, Any] = {}
 
     if checkpoint_mode:
         print(f"Loading checkpoint from {args.checkpoint_path}...")
         checkpoint = _load_checkpoint(args.checkpoint_path)
         checkpoint_config = checkpoint.get("config", {}) if isinstance(checkpoint.get("config"), dict) else {}
+
+    if args.init_from_checkpoint is not None:
+        print(f"Loading initialization checkpoint from {args.init_from_checkpoint}...")
+        init_checkpoint = _load_checkpoint(args.init_from_checkpoint)
 
     data_dir = resolve_data_dir(args.data_dir)
 
@@ -472,6 +487,11 @@ def main() -> None:
         microcategories=microcategories,
         settings=pipeline_settings,
     )
+
+    if args.init_from_checkpoint is not None:
+        pipeline.model.load_state_dict(init_checkpoint["model_state"])
+        print("Model weights initialized from checkpoint. Training will continue from this state.")
+
     llm_requested = bool(pipeline.use_llm_drafts)
     # Metrics should be deterministic and fast: avoid LLM calls on full val/test sets.
     pipeline.use_llm_drafts = False
@@ -499,16 +519,30 @@ def main() -> None:
     elif train_items and val_items:
         if args.no_early_stopping:
             print("Training without early stopping...")
-            losses = pipeline.train_on_labeled_items(
-                items=train_items,
-                optimizer=optimizer,
-                batch_size=training_settings.batch_size,
-                epochs=training_settings.epochs,
-                split_loss_weight=training_settings.split_loss_weight,
-                split_pos_weight=training_settings.split_pos_weight,
-                cross_encoder_loss_weight=training_settings.cross_encoder_loss_weight,
-                verbose=True,
-            )
+            losses: List[float] = []
+            for epoch in range(1, training_settings.epochs + 1):
+                epoch_loss = pipeline.train_on_labeled_items(
+                    items=train_items,
+                    optimizer=optimizer,
+                    batch_size=training_settings.batch_size,
+                    epochs=1,
+                    split_loss_weight=training_settings.split_loss_weight,
+                    split_pos_weight=training_settings.split_pos_weight,
+                    cross_encoder_loss_weight=training_settings.cross_encoder_loss_weight,
+                    verbose=False,
+                )[-1]
+                losses.append(epoch_loss)
+                val_metrics = evaluate_split_quality(pipeline, val_items)
+                print(
+                    f"Epoch {epoch}/{training_settings.epochs} | "
+                    f"train_loss={epoch_loss:.4f} | "
+                    f"val_f1={val_metrics['f1_micro']:.4f} | "
+                    f"val_precision={val_metrics['precision_micro']:.4f} | "
+                    f"val_recall={val_metrics['recall_micro']:.4f} | "
+                    f"shouldSplit_acc={val_metrics['should_split_accuracy']:.4f} | "
+                    f"threshold={pipeline.prob_threshold:.2f} | "
+                    f"split_threshold={pipeline.split_threshold:.2f}"
+                )
             print(f"Loss history: {losses}")
         else:
             print("Training with early stopping...")
@@ -540,6 +574,8 @@ def main() -> None:
     if val_items and checkpoint_mode:
         print("Validation metrics (loaded checkpoint):")
         print(json.dumps(evaluate_split_quality(pipeline, val_items), ensure_ascii=False, indent=2))
+        print("Validation detect metrics:")
+        print(json.dumps(evaluate_detect_quality(pipeline, val_items), ensure_ascii=False, indent=2))
         print(f"Retrieval recall on val: {evaluate_retrieval_recall(pipeline, val_items):.4f}")
     elif val_items:
         print("Validation metrics with tuned threshold:")
@@ -599,12 +635,16 @@ def main() -> None:
         print(f"Retrieval recall on val: {evaluate_retrieval_recall(pipeline, val_items):.4f}")
         print("Final val metrics:")
         print(json.dumps(evaluate_split_quality(pipeline, val_items), ensure_ascii=False, indent=2))
+        print("Final val detect metrics:")
+        print(json.dumps(evaluate_detect_quality(pipeline, val_items), ensure_ascii=False, indent=2))
 
     if test_items:
         print(f"\nTest set evaluation ({len(test_items)} items):")
         test_metrics = evaluate_split_quality(pipeline, test_items)
         print("Test metrics:")
         print(json.dumps(test_metrics, ensure_ascii=False, indent=2))
+        print("Test detect metrics:")
+        print(json.dumps(evaluate_detect_quality(pipeline, test_items), ensure_ascii=False, indent=2))
         
         print(f"\nRetreval recall on test: {evaluate_retrieval_recall(pipeline, test_items):.4f}")
         

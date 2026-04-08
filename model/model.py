@@ -110,11 +110,11 @@ class PipelineSettings:
     openrouter_app_name: str = "purple-avito-hackaton"
     normalize_text: bool = True
     noise_min_words: int = 3
-    noise_min_unique_ratio: float = 0.5
+    noise_min_unique_ratio: float = 0.35
     collapse_repeated_words: bool = True
     sentence_head_count: int = 1
     sentence_tail_count: int = 1
-    sentence_top_k: int = 3
+    sentence_top_k: int = 7
     long_text_mode: str = "head"
     long_text_window_tokens: int = 256
     long_text_stride_tokens: int = 192
@@ -169,10 +169,15 @@ def _normalize_text_content(text: str) -> str:
         return ""
 
     cleaned = unicodedata.normalize("NFKC", str(text))
+    # Some dataset rows contain literal escape sequences (e.g. "\\u2028") as plain text.
+    cleaned = re.sub(r"\\u[0-9a-fA-F]{4}|\\U[0-9a-fA-F]{8}", " ", cleaned)
     cleaned = cleaned.replace("\u00A0", " ")
     cleaned = re.sub(r"[\r\n\t]+", " ", cleaned)
     # Remove most emoji and pictographic symbols that add noise for retrieval/encoder.
     cleaned = re.sub(r"[\U0001F300-\U0001FAFF\U00002700-\U000027BF\U000024C2-\U0001F251]", " ", cleaned)
+    # Remove remaining unicode symbol noise (decorative blocks, dingbats, variation selectors).
+    cleaned = "".join(ch if unicodedata.category(ch) not in {"So", "Sk", "Cs", "Cf"} else " " for ch in cleaned)
+    cleaned = re.sub(r"[~]{3,}", " ", cleaned)
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
     return cleaned
 
@@ -589,11 +594,11 @@ class DraftSplitPipeline:
             openrouter_app_name: str = "purple-avito-hackaton",
             normalize_text: bool = True,
                 noise_min_words: int = 3,
-                noise_min_unique_ratio: float = 0.5,
+                noise_min_unique_ratio: float = 0.35,
                 collapse_repeated_words: bool = True,
                 sentence_head_count: int = 1,
                 sentence_tail_count: int = 1,
-                sentence_top_k: int = 3,
+                sentence_top_k: int = 7,
             settings: Optional[PipelineSettings] = None,
     ) -> None:
         _require_torch()
@@ -1326,6 +1331,35 @@ def evaluate_split_quality(
         "recall_micro": recall,
         "f1_micro": f1,
         "should_split_accuracy": accuracy,
+    }
+
+
+def evaluate_detect_quality(
+        pipeline: DraftSplitPipeline,
+        items: Sequence[LabeledItem],
+) -> Dict[str, float]:
+    """Compute micro Precision/Recall/F1 for detected categories against targetDetectedMcIds."""
+    tp = 0
+    fp = 0
+    fn = 0
+
+    for item in items:
+        pred = pipeline.predict(item)
+        pred_set = {mc_id for mc_id in pred.detected_mc_ids if mc_id != item.mc_id}
+        gold_set = set(item.target_detected_mc_ids)
+
+        tp += len(pred_set & gold_set)
+        fp += len(pred_set - gold_set)
+        fn += len(gold_set - pred_set)
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+
+    return {
+        "precision_micro": precision,
+        "recall_micro": recall,
+        "f1_micro": f1,
     }
 
 
