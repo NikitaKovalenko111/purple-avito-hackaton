@@ -1,4 +1,4 @@
-!#!/usr/bin/env bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 CHECK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,18 +18,18 @@ fi
 echo "Создание окружения..."
 
 $PY -m venv .venv
-.venv\Scripts\activate
+source .venv/bin/activate
 
 echo "Установка библиотек..."
 
-pip install -r requirements.txt
+pip install -r "$BACKEND_DIR/requirements.txt"
 
 echo "Миграция базы данных..."
 
-$PY manage.py migrate
+$PY "$BACKEND_DIR/manage.py" migrate
 
 echo "Запуск сервера..."
 
-$PY manage.py runserver
+$PY "$BACKEND_DIR/manage.py" runserver
 
 echo "Сервер запущен"
