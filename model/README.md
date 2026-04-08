@@ -1,77 +1,226 @@
-# Model Training Presets For Organizers
+# Модель: детекция микрокатегорий и split-draft
 
-Этот файл содержит готовые команды запуска обучения под разные цели метрик, чтобы можно было быстро выбрать режим без повторной разработки конфигурации.
+Этот документ описывает текущую модельную часть проекта: архитектуру, пайплайн, параметры, датасет, инференс, генерацию черновиков, масштабируемость и команды запуска.
 
-Для `rnc_dataset_markup_balanced.csv` режим `split-target` определяется автоматически как `detected`, потому что в этой ветке non-empty `targetSplitMcIds` совпадает с `targetDetectedMcIds`.
+## 1. Как работает модель: архитектура и пайплайн
 
-Все команды ниже запускаются из папки model:
+### 1.1 Общая схема
 
-cd D:\Github\purple-avito-hackaton\model
+Модель решает 2 подзадачи:
 
-Если на машине нет CUDA, замените в командах --device cuda на --device cpu.
+1. Детекция релевантных микрокатегорий (`detectedMcIds`)
+2. Решение, нужно ли делить объявление (`shouldSplit`)
 
-## 1) Баланс по F1 (рекомендуемый базовый режим)
+Пайплайн состоит из этапов:
 
-python run.py --data-dir .\data --dataset-file rnc_dataset_markup_balanced.csv --epochs 10 --no-early-stopping --batch-size 2 --lr 3e-5 --weight-decay 0.01 --max-length 384 --long-text-mode chunks --long-text-window-tokens 256 --long-text-stride-tokens 192 --long-text-max-windows 4 --use-cross-encoder --cross-encoder-alpha 0.5 --cross-encoder-loss-weight 0.5 --noise-min-words 3 --noise-min-unique-ratio 0.4 --sentence-head-count 1 --sentence-tail-count 1 --sentence-top-k 5 --top-k-drafts-grid 11 --max-drafts-grid 0 --score-margin-grid 1.0 --relative-ratio-grid 0.0 --score-blend-alpha-grid 1.0 --threshold-grid 0.03 0.04 0.05 0.06 0.08 0.10 --split-threshold-grid 0.30 0.35 0.40 0.45 0.50 --class-threshold-grid 0.03 0.04 0.05 0.06 0.08 --optimize-for f1 --min-recall 0.0 --device cuda
+1. Предобработка текста объявления
+2. TF-IDF retriever (кандидаты категорий)
+3. Transformer-encoder + softmax scoring по кандидатам
+4. Отдельная split-голова (`shouldSplit`) с учетом:
+    - скрытого представления текста
+    - keyword/surface признаков
+5. Пороговая фильтрация и reranking
+6. Формирование `drafts` (template или LLM)
 
-Когда использовать:
+### 1.2 Архитектурные компоненты
 
-- Нужен компромисс между precision и recall
-- Нужен отчетный baseline для сравнения
+- `TfidfMicroCategoryRetriever`:
+    - кандидаты по key phrases микрокатегорий
+    - word n-grams + optional char n-grams
+- `TransformerSoftmaxSplitModel`:
+    - текстовый энкодер (`DeepPavlov/rubert-base-cased` по умолчанию)
+    - softmax логиты по candidate категориям
+    - split-голова для `shouldSplit`
+- `DraftSplitPipeline`:
+    - объединяет retriever, нейросеть, пороги, reranking и генерацию черновиков
 
-## 2) Recall-first (ловим больше релевантных микрокатегорий)
+### 1.3 Что оптимизируется в обучении
 
-python run.py --data-dir .\data --dataset-file rnc_dataset_markup_balanced.csv --epochs 10 --no-early-stopping --batch-size 2 --lr 3e-5 --weight-decay 0.01 --max-length 384 --long-text-mode chunks --long-text-window-tokens 256 --long-text-stride-tokens 192 --long-text-max-windows 4 --use-cross-encoder --cross-encoder-alpha 0.4 --cross-encoder-loss-weight 0.6 --noise-min-words 2 --noise-min-unique-ratio 0.35 --sentence-head-count 1 --sentence-tail-count 1 --sentence-top-k 7 --top-k-drafts-grid 11 --max-drafts-grid 0 --score-margin-grid 1.0 --relative-ratio-grid 0.0 --score-blend-alpha-grid 0.9 1.0 --threshold-grid 0.02 0.03 0.04 0.05 0.06 --split-threshold-grid 0.25 0.30 0.35 0.40 0.45 --class-threshold-grid 0.02 0.03 0.04 0.05 0.06 --optimize-for recall --min-recall 0.0 --device cuda
+Итоговый loss:
 
-Когда использовать:
+1. KLDiv loss для распределения по target категориям
+2. BCEWithLogits loss для `shouldSplit`
 
-- Важнее не пропустить класс, чем уменьшить ложные срабатывания
-- Приоритет для этапа candidate recall
+Сигнал `shouldSplit` усилен через `split_pos_weight` (положительный класс весится сильнее).
 
-## 3) Precision-first (минимум лишних черновиков)
+## 2. Настраиваемые параметры
 
-python run.py --data-dir .\data --dataset-file rnc_dataset_markup_balanced.csv --epochs 10 --no-early-stopping --batch-size 2 --lr 3e-5 --weight-decay 0.01 --max-length 384 --long-text-mode chunks --long-text-window-tokens 256 --long-text-stride-tokens 192 --long-text-max-windows 4 --use-cross-encoder --cross-encoder-alpha 0.6 --cross-encoder-loss-weight 0.4 --noise-min-words 3 --noise-min-unique-ratio 0.5 --sentence-head-count 1 --sentence-tail-count 1 --sentence-top-k 3 --top-k-drafts-grid 5 7 --max-drafts-grid 3 5 --score-margin-grid 0.2 0.12 --relative-ratio-grid 0.4 0.6 --score-blend-alpha-grid 1.0 --threshold-grid 0.06 0.08 0.10 0.12 --split-threshold-grid 0.40 0.45 0.50 0.55 --class-threshold-grid 0.06 0.08 0.10 --optimize-for precision --min-recall 0.0 --device cuda
+Ниже ключевые параметры CLI (`run.py`) и что они делают.
 
-Когда использовать:
+### 2.1 Данные и модель
 
-- Важнее качество каждого предложенного драфта
-- Нужно меньше ложных классов в выдаче
+- `--data-dir`: путь к папке данных
+- `--dataset-file`: конкретный CSV/JSONL датасет
+- `--transformer-name`: базовый transformer
+- `--max-length`: max token length
+- `--long-text-mode`: `head` | `head_tail` | `chunks`
+- `--long-text-window-tokens`, `--long-text-stride-tokens`, `--long-text-max-windows`: контроль chunking
 
-## 4) Быстрый sanity-run (проверка пайплайна)
+### 2.2 Candidate retrieval и классификация
 
-python run.py --data-dir .\data --dataset-file rnc_dataset_markup_balanced.csv --epochs 3 --no-early-stopping --batch-size 2 --max-length 256 --long-text-mode head_tail --use-cross-encoder --top-k-drafts-grid 7 --max-drafts-grid 0 --score-margin-grid 1.0 --relative-ratio-grid 0.0 --score-blend-alpha-grid 1.0 --optimize-for f1 --min-recall 0.0 --device cuda
+- `--tfidf-threshold`, `--tfidf-top-k`: чувствительность retriever
+- `--prob-threshold`: порог по category probability
+- `--class-threshold-grid`: поиск per-class порогов на val
+- `--score-blend-alpha`: blend neural score и TF-IDF score
 
-Когда использовать:
+### 2.3 shouldSplit
 
-- Быстро проверить, что код, данные и сохранение чекпоинта работают
-- Не использовать как финальный отчетный прогон
+- `--split-threshold`: порог решения `shouldSplit`
+- `--split-threshold-grid`: тюнинг split порога на val
+- `--split-pos-weight`: усиление positive класса в BCE (ключевой параметр для recall)
 
-## 5) Curriculum learning (сначала простой датасет, потом тяжелый)
+### 2.4 Reranking и число draft
 
-Этот режим полезен, если на тяжелом датасете recall сильно проседает.
+- `--top-k-drafts-grid`: top-k до фильтров
+- `--max-drafts`, `--max-drafts-grid`: максимум draft
+- `--score-margin`, `--score-margin-grid`: абсолютный margin от top score
+- `--relative-ratio`, `--relative-ratio-grid`: относительный фильтр
 
-Шаг 1 (предобучение на более простом датасете):
+### 2.5 Обучение
 
-python run.py --data-dir .\data --dataset-file rnc_dataset.csv --epochs 5 --batch-size 4 --lr 3e-5 --weight-decay 0.01 --max-length 384 --long-text-mode chunks --long-text-window-tokens 256 --long-text-stride-tokens 192 --long-text-max-windows 64 --top-k-drafts-grid 11 --max-drafts-grid 0 --score-margin-grid 1.0 --relative-ratio-grid 0.0 --score-blend-alpha-grid 1.0 --threshold-grid 0.03 0.04 0.05 0.06 0.08 --split-threshold-grid 0.30 0.35 0.40 0.45 0.50 --class-threshold-grid 0.03 0.04 0.05 0.06 0.08 --optimize-for f1 --min-recall 0.0 --output-dir .\checkpoints\stage1_simple --device cuda
+- `--epochs`, `--batch-size`, `--lr`, `--weight-decay`
+- `--patience`: early stopping patience
+- `--no-early-stopping`: отключить early stopping
+- `--optimize-for`: `f1` | `precision` | `recall`
+- `--min-recall`: ограничение при поиске порогов
 
-Шаг 2 (дообучение на тяжелом датасете из весов шага 1):
+### 2.6 Чекпоинты
 
-python run.py --data-dir .\data --dataset-file rnc_dataset_markup_balanced.csv --init-from-checkpoint .\checkpoints\stage1_simple\model_checkpoint.pt --epochs 7 --batch-size 4 --lr 1e-5 --weight-decay 0.01 --max-length 384 --long-text-mode chunks --long-text-window-tokens 256 --long-text-stride-tokens 192 --long-text-max-windows 64 --noise-min-words 2 --noise-min-unique-ratio 0.35 --sentence-head-count 1 --sentence-tail-count 1 --sentence-top-k 7 --top-k-drafts-grid 11 --max-drafts-grid 0 --score-margin-grid 1.0 --relative-ratio-grid 0.0 --score-blend-alpha-grid 1.0 --threshold-grid 0.02 0.03 0.04 0.05 0.06 --split-threshold-grid 0.25 0.30 0.35 0.40 0.45 --class-threshold-grid 0.02 0.03 0.04 0.05 0.06 --optimize-for recall --min-recall 0.0 --output-dir .\checkpoints\stage2_heavy --device cuda
+- `--output-dir`: куда сохранять чекпоинт
+- `--checkpoint-path`: загрузить чекпоинт и пропустить training
+- `--init-from-checkpoint`: старт обучения из весов
 
-Примечания:
+## 3. Кратко про датасет
 
-- Используйте --checkpoint-path только для инференса без обучения.
-- Для обучения из готовых весов используйте --init-from-checkpoint.
-- Если простой датасет называется иначе, замените rnc_dataset.csv на нужный файл.
+Основной рабочий датасет в текущих экспериментах:
 
-## Интерпретация результатов
+- `data/rnc_dataset_markup_balanced.csv`
 
-- Если retrieval recall высокий, а micro recall низкий: проблема в порогах и reranking, а не в retriever.
-- Если precision высокий, recall низкий: ослабить thresholds, увеличить sentence-top-k, не ограничивать max-drafts.
-- Если recall высокий, precision низкий: ужесточить thresholds и включить более жесткий reranking.
+Ключевые поля:
 
-## Что сдавать организаторам
+- `description`: текст объявления
+- `targetDetectedMcIds`: целевые найденные категории
+- `targetSplitMcIds`: целевые категории для split
+- `shouldSplit`: бинарная цель деления
+- `split`: train/val/test
 
-- Основной режим: раздел 1 (баланс по F1)
-- Дополнительно: один из режимов раздела 2 или 3, если нужна аргументация trade-off
-- В отчете указывать не только F1, но и отдельно precision, recall, should_split_accuracy
+Важно для `markup_balanced`:
+
+- в этой ветке при non-empty `targetSplitMcIds` он обычно совпадает с `targetDetectedMcIds`
+- поэтому задача практически сводится к:
+    - детекция категорий
+    - бинарное решение `shouldSplit`
+
+## 4. Время инференса
+
+Точное время зависит от:
+
+- устройства (`cpu`/`cuda`)
+- длины текста
+- режима long text (`head` быстрее, `chunks` медленнее)
+- количества кандидатов
+
+Практический ориентир:
+
+- CPU: обычно десятки-сотни миллисекунд на объявление после прогрева
+- GPU: обычно быстрее, но сильно зависит от батчинга и PCIe overhead
+
+Рекомендуется измерять локально тем же конфигом, что в проде.
+
+Мини-бенчмарк можно сделать через 100-1000 одинаковых вызовов `pipeline.predict(...)` после warm-up и посчитать p50/p95.
+
+## 5. Генерация черновиков
+
+Поддерживается 2 режима:
+
+1. Template generation (по умолчанию)
+2. LLM generation через OpenRouter (`--use-llm-drafts`)
+
+Логика:
+
+- для train/val/test метрик LLM обычно отключается для детерминизма
+- для sample/production можно включить LLM
+- при ошибке LLM используется template fallback
+
+Ключевые параметры:
+
+- `--use-llm-drafts`
+- `--openrouter-model`
+- `--openrouter-api-key`
+- `--openrouter-base-url`
+- `--openrouter-timeout-sec`
+
+## 6. Масштабируемость
+
+### 6.1 Увеличение числа категорий
+
+Это относительно просто:
+
+1. Добавить категории и key phrases в `rnc_mic_key_phrases.csv`
+2. Переобучить модель
+
+Ограничения:
+
+- с ростом числа категорий ухудшается разделимость и растет стоимость reranking
+- может потребоваться:
+    - более строгий retriever
+    - более агрессивные thresholds
+    - larger model / больше данных
+
+### 6.2 Увеличение длины текстов
+
+Поддерживается через `long_text_mode=chunks`, но это увеличивает latency и память.
+
+### 6.3 Прод-сервер
+
+Для API рекомендуется:
+
+- загружать пайплайн один раз при старте процесса
+- держать модель прогретой
+- не делать повторную инициализацию на каждый запрос
+
+## 7. Команды для работы с моделью
+
+Все команды ниже запускать из папки `model`.
+
+### 7.1 Обучение (markup_balanced, early stopping)
+
+```bash
+python run.py --data-dir .\data --dataset-file rnc_dataset_markup_balanced.csv --epochs 10 --batch-size 4 --lr 3e-5 --weight-decay 0.01 --max-length 512 --long-text-mode chunks --long-text-window-tokens 256 --long-text-stride-tokens 192 --long-text-max-windows 4 --split-pos-weight 3.0 --optimize-for recall --min-recall 0.0 --patience 3 --split-target-mode auto --device cuda
+```
+
+### 7.2 Обучение без early stopping
+
+```bash
+python run.py --data-dir .\data --dataset-file rnc_dataset_markup_balanced.csv --epochs 10 --batch-size 4 --lr 3e-5 --weight-decay 0.01 --max-length 512 --long-text-mode chunks --long-text-window-tokens 256 --long-text-stride-tokens 192 --long-text-max-windows 4 --split-pos-weight 3.0 --optimize-for recall --min-recall 0.0 --no-early-stopping --split-target-mode auto --device cuda
+```
+
+### 7.3 Инференс из чекпоинта (без обучения)
+
+```bash
+python run.py --data-dir .\data --dataset-file rnc_dataset_markup_balanced.csv --checkpoint-path .\checkpoints\model_checkpoint.pt --split-target-mode auto --device cuda
+```
+
+### 7.4 Дообучение из существующих весов
+
+```bash
+python run.py --data-dir .\data --dataset-file rnc_dataset_markup_balanced.csv --init-from-checkpoint .\checkpoints\model_checkpoint.pt --epochs 5 --batch-size 4 --lr 1e-5 --patience 3 --device cuda
+```
+
+### 7.5 CPU вариант
+
+Заменить в любой команде:
+
+```bash
+--device cuda
+```
+
+на
+
+```bash
+--device cpu
+```
+
+---
+
+Если в логах видно, что val recall падает после ранних эпох, обычно лучший checkpoint находится на 1-3 эпохе, и имеет смысл сохранять/использовать именно его.
