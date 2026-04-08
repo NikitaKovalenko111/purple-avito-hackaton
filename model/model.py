@@ -427,6 +427,7 @@ class TransformerSoftmaxSplitModel(_BaseModule):
             long_text_window_tokens: int = 256,
             long_text_stride_tokens: int = 192,
             long_text_max_windows: int = 4,
+            split_keyword_phrases: Optional[Sequence[str]] = None,
     ) -> None:
         _require_torch()
         _require_transformers()
@@ -456,6 +457,11 @@ class TransformerSoftmaxSplitModel(_BaseModule):
         )
         self.cross_head = nn.Linear(self.hidden_dim, 1)
         self.temperature = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+        self._split_keyword_lexicon = tuple(
+            str(phrase).strip().lower()
+            for phrase in (split_keyword_phrases or ())
+            if str(phrase).strip()
+        )
 
     def _pool(self, last_hidden_state: Any, attention_mask: Any) -> Any:
         mask = attention_mask.unsqueeze(-1).float()
@@ -566,6 +572,28 @@ class TransformerSoftmaxSplitModel(_BaseModule):
         temp = torch.clamp(self.temperature, min=0.05)
         return logits / temp
 
+    def _split_keyword_features(self, text: str, device: Any) -> Any:
+        lower_text = str(text).lower()
+        words = _tokenize_words(lower_text)
+        sentences = _split_into_sentences(lower_text)
+
+        hit_phrases = [phrase for phrase in self._split_keyword_lexicon if phrase in lower_text]
+        total_hits = sum(lower_text.count(phrase) for phrase in hit_phrases)
+        sentence_hits = sum(
+            1 for sentence in sentences if any(phrase in sentence for phrase in self._split_keyword_lexicon)
+        )
+
+        features = [
+            1.0 if hit_phrases else 0.0,
+            len(hit_phrases) / max(len(self._split_keyword_lexicon), 1),
+            total_hits / max(len(words), 1),
+            sentence_hits / max(len(sentences), 1) if sentences else 0.0,
+        ]
+        return torch.tensor(features, dtype=torch.float32, device=device)
+
+    def _split_keyword_feature_batch(self, texts: Sequence[str], device: Any) -> Any:
+        return torch.stack([self._split_keyword_features(text, device) for text in texts], dim=0)
+
     def split_logits(self, text_embeddings: Any, texts: Optional[Sequence[str]] = None) -> Any:
         if text_embeddings.dim() == 1:
             text_embeddings = text_embeddings.unsqueeze(0)
@@ -577,7 +605,7 @@ class TransformerSoftmaxSplitModel(_BaseModule):
                 device=text_embeddings.device,
             )
         else:
-            keyword_features = self._split_keyword_feature_batch(texts).to(text_embeddings.device)
+            keyword_features = self._split_keyword_feature_batch(texts, text_embeddings.device)
             if keyword_features.dim() == 1:
                 keyword_features = keyword_features.unsqueeze(0)
 
@@ -645,6 +673,7 @@ class DraftSplitPipeline:
                 sentence_head_count: int = 1,
                 sentence_tail_count: int = 1,
                 sentence_top_k: int = 7,
+                split_keyword_phrases: Optional[Sequence[str]] = None,
             settings: Optional[PipelineSettings] = None,
     ) -> None:
         _require_torch()
@@ -712,6 +741,7 @@ class DraftSplitPipeline:
             long_text_window_tokens=long_text_window_tokens,
             long_text_stride_tokens=long_text_stride_tokens,
             long_text_max_windows=long_text_max_windows,
+            split_keyword_phrases=split_keyword_phrases,
         ).to(self.device)
         self.prob_threshold = prob_threshold
         self.split_threshold = split_threshold
@@ -739,7 +769,7 @@ class DraftSplitPipeline:
             raise ValueError("split_target_mode must be either 'split' or 'detected'")
         self.split_keyword_phrases = tuple(
             str(phrase).strip().lower()
-            for phrase in split_keyword_phrases
+            for phrase in (split_keyword_phrases or ())
             if str(phrase).strip()
         )
         self.top_k_drafts = max(0, int(top_k_drafts))
