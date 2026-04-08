@@ -1093,7 +1093,7 @@ class DraftSplitPipeline:
                 split_loss_weight=settings.split_loss_weight,
                 split_pos_weight=settings.split_pos_weight,
                 cross_encoder_loss_weight=settings.cross_encoder_loss_weight,
-                verbose=verbose,
+                verbose=False,
             )
             loss_value = loss_history[-1] if loss_history else 0.0
             threshold_report = search_best_probability_threshold(
