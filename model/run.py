@@ -305,7 +305,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--split-pos-weight",
         type=float,
-        default=5.0,
+        default=3.0,
         help="Positive class weight for shouldSplit BCE loss (>1 increases split recall).",
     )
     parser.add_argument(
