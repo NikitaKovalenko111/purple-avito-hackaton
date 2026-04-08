@@ -1,0 +1,2 @@
+REQUEST_STORE = {}
+REQUEST_STARTED = set()

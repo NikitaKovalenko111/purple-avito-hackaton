@@ -27,6 +27,11 @@
 - caseType: тип сценария
 - split: train / val / test
 
+Примечание по rnc_dataset_markup_balanced.*:
+- если targetSplitMcIds не пустой, он совпадает с targetDetectedMcIds
+- строгих подмножеств split внутри detected в этом варианте датасета нет
+- для этой ветки задач split лучше трактовать как бинарное решение о создании draft, а detected — как набор найденных микрокатегорий
+
 Статистика:
 - всего записей: 3000
 - доля shouldSplit=true: 0.371
