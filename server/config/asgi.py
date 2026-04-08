@@ -7,7 +7,7 @@ from channels.routing import ProtocolTypeRouter, URLRouter
 from channels.auth import AuthMiddlewareStack
 from django.urls import path
 
-from api.consumers import PredictConsumer
+from prediction.consumers import PredictConsumer
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
 

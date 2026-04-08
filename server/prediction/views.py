@@ -9,6 +9,8 @@ from rest_framework import status
 from .serializers import PredictRequestSerializer
 from .tasks import generate_drafts
 from .model_service import run_prediction
+from .storage import REQUEST_STORE
+
 
 
 class PredictView(APIView):
@@ -21,6 +23,14 @@ class PredictView(APIView):
 
         prediction = run_prediction(data)
 
+
+        split_categories = prediction["splitCategories"]
+
+        REQUEST_STORE[request_id] = {
+            "item_data": data,
+            "split_categories": split_categories,
+        }
+
         detected_mc_ids = prediction["detectedMcIds"]
         should_split = prediction["shouldSplit"]
         split_categories = prediction["splitCategories"]
@@ -29,19 +39,6 @@ class PredictView(APIView):
         print(f"[PREDICT] detected_mc_ids={detected_mc_ids}")
         print(f"[PREDICT] should_split={should_split}")
         print(f"[PREDICT] split_categories={split_categories}")
-
-        if should_split and split_categories:
-            print("[PREDICT] starting background task")
-
-            thread = threading.Thread(
-                target=lambda: async_to_sync(generate_drafts)(
-                    request_id=request_id,
-                    item_data=data,
-                    split_categories=split_categories,
-                ),
-                daemon=True,
-            )
-            thread.start()
 
         return Response(
             {

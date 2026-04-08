@@ -1,10 +1,18 @@
 import asyncio
 from channels.layers import get_channel_layer
-
+from .storage import REQUEST_STORE
 from .llm_service import generate_draft_with_llm
 
 
-async def generate_drafts(request_id, item_data, split_categories):
+async def generate_drafts(request_id):
+    data = REQUEST_STORE.get(request_id)
+
+    if not data:
+        print(f"[TASK ERROR] no data found for request_id={request_id}")
+        return
+
+    item_data = data["item_data"]
+    split_categories = data["split_categories"]
     channel_layer = get_channel_layer()
 
     print(f"[TASK START] request_id={request_id}")

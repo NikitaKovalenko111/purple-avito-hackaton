@@ -1,19 +1,30 @@
 import json
 from channels.generic.websocket import AsyncWebsocketConsumer
-
+from .tasks import generate_drafts
+from asgiref.sync import async_to_sync
+import asyncio
+from .storage import REQUEST_STARTED
 
 class PredictConsumer(AsyncWebsocketConsumer):
     async def connect(self):
         self.request_id = self.scope["url_route"]["kwargs"]["request_id"]
         self.room_group_name = f"predict_{self.request_id}"
 
-        print(f"[WS CONNECT] request_id={self.request_id} room={self.room_group_name}")
-
         await self.channel_layer.group_add(
             self.room_group_name,
-            self.channel_name,
+            self.channel_name
         )
+
         await self.accept()
+
+        if self.request_id not in REQUEST_STARTED:
+            REQUEST_STARTED.add(self.request_id)
+
+            print(f"[WS CONNECT] запуск генерации request_id={self.request_id}")
+
+            asyncio.create_task(
+                generate_drafts(self.request_id)
+            )
 
     async def disconnect(self, close_code):
         print(f"[WS DISCONNECT] request_id={self.request_id}")
