@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPTS_DIR="$SCRIPT_DIR/../bashScripts"
+SCRIPTS_DIR="$SCRIPT_DIR/bashScripts"
 
 echo "Запуск проекта..."
 
