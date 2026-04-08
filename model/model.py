@@ -904,6 +904,7 @@ class DraftSplitPipeline:
         if batch_size <= 0:
             raise ValueError("batch_size must be > 0")
 
+        total_steps = (len(items) + batch_size - 1) // batch_size if items else 0
         for _ in range(epochs):
             epoch_index = len(history) + 1
             epoch_loss = 0.0
@@ -931,9 +932,21 @@ class DraftSplitPipeline:
                 )
                 epoch_loss += loss
                 steps += 1
+                if verbose and total_steps > 0:
+                    avg_loss = epoch_loss / max(steps, 1)
+                    progress = (steps / total_steps) * 100.0
+                    print(
+                        f"Epoch {epoch_index}/{epochs} | "
+                        f"step {steps}/{total_steps} ({progress:5.1f}%) | "
+                        f"avg_loss={avg_loss:.4f}",
+                        end="\r",
+                        flush=True,
+                    )
             epoch_avg_loss = epoch_loss / max(steps, 1)
             history.append(epoch_avg_loss)
             if verbose:
+                if total_steps > 0:
+                    print()
                 print(f"Epoch {epoch_index}/{epochs} | train_loss={epoch_avg_loss:.4f}")
         return history
 
@@ -963,7 +976,7 @@ class DraftSplitPipeline:
                 split_loss_weight=settings.split_loss_weight,
                 split_pos_weight=settings.split_pos_weight,
                 cross_encoder_loss_weight=settings.cross_encoder_loss_weight,
-                verbose=False,
+                verbose=verbose,
             )
             loss_value = loss_history[-1] if loss_history else 0.0
             threshold_report = search_best_probability_threshold(
