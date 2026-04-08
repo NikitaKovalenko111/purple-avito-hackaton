@@ -115,6 +115,28 @@ class PipelineSettings:
     sentence_head_count: int = 1
     sentence_tail_count: int = 1
     sentence_top_k: int = 7
+    split_target_mode: str = "split"
+    split_keyword_phrases: Tuple[str, ...] = (
+        "отдельно",
+        "по отдельности",
+        "раздельно",
+        "разделить",
+        "разделим",
+        "разделю",
+        "разбить",
+        "по частям",
+        "частями",
+        "при необходимости",
+        "при необходимости отдельно",
+        "отдельные виды",
+        "частичный ремонт",
+        "поэтапный ремонт",
+        "несколько вариантов",
+        "варианты",
+        "дополнительно",
+        "можно отдельно",
+        "отдельный",
+    )
     long_text_mode: str = "head"
     long_text_window_tokens: int = 256
     long_text_stride_tokens: int = 192
@@ -424,7 +446,14 @@ class TransformerSoftmaxSplitModel(_BaseModule):
         self.projection = nn.Linear(encoder_hidden, self.hidden_dim)
         self.dropout = nn.Dropout(dropout)
         self.mc_embeddings = nn.Embedding(num_microcategories, self.hidden_dim)
+        self.split_feature_dim = 4
         self.split_head = nn.Linear(self.hidden_dim, 1)
+        self.split_keyword_head = nn.Sequential(
+            nn.Linear(self.split_feature_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_dim, 1),
+        )
         self.cross_head = nn.Linear(self.hidden_dim, 1)
         self.temperature = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
 
@@ -537,8 +566,25 @@ class TransformerSoftmaxSplitModel(_BaseModule):
         temp = torch.clamp(self.temperature, min=0.05)
         return logits / temp
 
-    def split_logits(self, text_embeddings: Any) -> Any:
-        return self.split_head(text_embeddings).squeeze(-1)
+    def split_logits(self, text_embeddings: Any, texts: Optional[Sequence[str]] = None) -> Any:
+        if text_embeddings.dim() == 1:
+            text_embeddings = text_embeddings.unsqueeze(0)
+
+        if texts is None:
+            keyword_features = torch.zeros(
+                (text_embeddings.size(0), self.split_feature_dim),
+                dtype=text_embeddings.dtype,
+                device=text_embeddings.device,
+            )
+        else:
+            keyword_features = self._split_keyword_feature_batch(texts).to(text_embeddings.device)
+            if keyword_features.dim() == 1:
+                keyword_features = keyword_features.unsqueeze(0)
+
+        return (
+            self.split_head(text_embeddings).squeeze(-1)
+            + self.split_keyword_head(keyword_features).squeeze(-1)
+        )
 
     def cross_logits(self, texts: Sequence[str], candidate_texts: Sequence[str], device: Any) -> Any:
         if len(texts) != len(candidate_texts):
@@ -641,6 +687,8 @@ class DraftSplitPipeline:
             sentence_head_count = settings.sentence_head_count
             sentence_tail_count = settings.sentence_tail_count
             sentence_top_k = settings.sentence_top_k
+            split_target_mode = settings.split_target_mode
+            split_keyword_phrases = settings.split_keyword_phrases
 
         self.id_to_title = {mc.mc_id: mc.mc_title for mc in self.microcategories}
         self.id_to_idx = {mc.mc_id: i for i, mc in enumerate(self.microcategories)}
@@ -686,6 +734,14 @@ class DraftSplitPipeline:
         self.sentence_head_count = max(0, int(sentence_head_count))
         self.sentence_tail_count = max(0, int(sentence_tail_count))
         self.sentence_top_k = max(0, int(sentence_top_k))
+        self.split_target_mode = str(split_target_mode).strip().lower()
+        if self.split_target_mode not in {"split", "detected"}:
+            raise ValueError("split_target_mode must be either 'split' or 'detected'")
+        self.split_keyword_phrases = tuple(
+            str(phrase).strip().lower()
+            for phrase in split_keyword_phrases
+            if str(phrase).strip()
+        )
         self.top_k_drafts = max(0, int(top_k_drafts))
         self.use_cross_encoder = bool(use_cross_encoder)
         self.cross_encoder_alpha = min(1.0, max(0.0, float(cross_encoder_alpha)))
@@ -699,9 +755,37 @@ class DraftSplitPipeline:
             for p in mc.key_phrases
             if p and p.strip()
         }
+        self._split_keyword_lexicon = set(self.split_keyword_phrases)
         self.llm_success_count = 0
         self.llm_fallback_count = 0
         self.last_llm_error: Optional[str] = None
+
+    def _get_split_target_mc_ids(self, item: LabeledItem) -> List[int]:
+        if self.split_target_mode == "detected":
+            return list(item.target_detected_mc_ids)
+        return list(item.target_split_mc_ids)
+
+    def _split_keyword_features(self, text: str) -> Any:
+        lower_text = str(text).lower()
+        words = _tokenize_words(lower_text)
+        sentences = _split_into_sentences(lower_text)
+
+        hit_phrases = [phrase for phrase in self._split_keyword_lexicon if phrase in lower_text]
+        total_hits = sum(lower_text.count(phrase) for phrase in hit_phrases)
+        sentence_hits = sum(
+            1 for sentence in sentences if any(phrase in sentence for phrase in self._split_keyword_lexicon)
+        )
+
+        features = [
+            1.0 if hit_phrases else 0.0,
+            len(hit_phrases) / max(len(self._split_keyword_lexicon), 1),
+            total_hits / max(len(words), 1),
+            sentence_hits / max(len(sentences), 1) if sentences else 0.0,
+        ]
+        return torch.tensor(features, dtype=torch.float32, device=self.device)
+
+    def _split_keyword_feature_batch(self, texts: Sequence[str]) -> Any:
+        return torch.stack([self._split_keyword_features(text) for text in texts], dim=0)
 
     def _sentence_signal_score(self, sentence: str) -> float:
         words = _tokenize_words(sentence)
@@ -849,7 +933,7 @@ class DraftSplitPipeline:
                 target_distribution,
                 reduction="batchmean",
             )
-            split_logit = self.model.split_logits(text_emb).view(-1)
+            split_logit = self.model.split_logits(text_emb, [prepared_text]).view(-1)
             split_target = torch.tensor([1.0 if should_split_target else 0.0], device=self.device)
             pos_weight = torch.tensor([max(1e-6, float(split_pos_weight))], device=self.device)
             split_loss = nn.functional.binary_cross_entropy_with_logits(
@@ -913,10 +997,13 @@ class DraftSplitPipeline:
                 batch = items[i: i + batch_size]
                 texts = [x.description for x in batch]
                 candidates = [
-                    self.build_candidates(x, force_include=x.target_split_mc_ids if force_include_targets else None)
+                    self.build_candidates(
+                        x,
+                        force_include=self._get_split_target_mc_ids(x) if force_include_targets else None,
+                    )
                     for x in batch
                 ]
-                target_mc_ids = [x.target_split_mc_ids for x in batch]
+                target_mc_ids = [self._get_split_target_mc_ids(x) for x in batch]
                 should_split_targets = [x.should_split for x in batch]
                 source_mc_ids = [x.mc_id for x in batch]
                 loss = self.train_step(
@@ -1248,7 +1335,7 @@ class DraftSplitPipeline:
         self.model.eval()
         with torch.no_grad():
             text_emb = self.model.encode_text([prepared_description], self.device)
-            split_prob = torch.sigmoid(self.model.split_logits(text_emb).view(-1)).item()
+            split_prob = torch.sigmoid(self.model.split_logits(text_emb, [prepared_description]).view(-1)).item()
 
         selected = [
             (mc_id, score)
@@ -1318,7 +1405,7 @@ def evaluate_split_quality(
         pipeline: DraftSplitPipeline,
         items: Sequence[LabeledItem],
 ) -> Dict[str, float]:
-    """Compute micro Precision/Recall/F1 for targetSplitMcIds and shouldSplit accuracy."""
+    """Compute micro Precision/Recall/F1 for the configured split target mode and shouldSplit accuracy."""
     tp = 0
     fp = 0
     fn = 0
@@ -1327,7 +1414,7 @@ def evaluate_split_quality(
     for item in items:
         pred = pipeline.predict(item)
         pred_set = {d.mc_id for d in pred.drafts}
-        gold_set = set(item.target_split_mc_ids)
+        gold_set = set(pipeline._get_split_target_mc_ids(item))
 
         tp += len(pred_set & gold_set)
         fp += len(pred_set - gold_set)

@@ -2,6 +2,8 @@
 
 Этот файл содержит готовые команды запуска обучения под разные цели метрик, чтобы можно было быстро выбрать режим без повторной разработки конфигурации.
 
+Для `rnc_dataset_markup_balanced.csv` режим `split-target` определяется автоматически как `detected`, потому что в этой ветке non-empty `targetSplitMcIds` совпадает с `targetDetectedMcIds`.
+
 Все команды ниже запускаются из папки model:
 
 cd D:\Github\purple-avito-hackaton\model

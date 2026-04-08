@@ -175,6 +175,13 @@ def parse_args() -> argparse.Namespace:
         help="Candidate shouldSplit thresholds to search on validation.",
     )
     parser.add_argument(
+        "--split-target-mode",
+        type=str,
+        choices=["auto", "split", "detected"],
+        default="auto",
+        help="Which labels to use as the draft target: raw split labels, detected labels, or auto-detect from data.",
+    )
+    parser.add_argument(
         "--threshold-grid",
         type=float,
         nargs="+",
@@ -328,6 +335,19 @@ def load_items(data_dir: Path, use_jsonl: bool, dataset_file: Path | None = None
     return load_labeled_items_csv(str(dataset_path))
 
 
+def infer_split_target_mode(items: List[object]) -> str:
+    has_positive_split = False
+    for item in items:
+        target_split = set(getattr(item, "target_split_mc_ids", []))
+        if not target_split:
+            continue
+        has_positive_split = True
+        target_detected = set(getattr(item, "target_detected_mc_ids", []))
+        if target_split != target_detected:
+            return "split"
+    return "detected" if has_positive_split else "split"
+
+
 def resolve_data_dir(data_dir: Path) -> Path:
     if data_dir.exists():
         return data_dir
@@ -412,6 +432,11 @@ def main() -> None:
     print(f"Loading dataset ({dataset_label}) from {data_dir}...")
     items = load_items(data_dir, args.use_jsonl, args.dataset_file)
     buckets = split_dataset(items)
+    inferred_split_target_mode = infer_split_target_mode(items)
+    split_target_mode = (
+        inferred_split_target_mode if args.split_target_mode == "auto" else args.split_target_mode
+    )
+    print(f"Split target mode: {split_target_mode} (inferred={inferred_split_target_mode})")
 
     train_items = buckets.get("train", [])
     val_items = buckets.get("val", [])
@@ -468,6 +493,7 @@ def main() -> None:
         sentence_head_count=int(checkpoint_config.get("sentence_head_count", args.sentence_head_count)),
         sentence_tail_count=int(checkpoint_config.get("sentence_tail_count", args.sentence_tail_count)),
         sentence_top_k=int(checkpoint_config.get("sentence_top_k", args.sentence_top_k)),
+        split_target_mode=str(checkpoint_config.get("split_target_mode", split_target_mode)),
     )
     training_settings = TrainingSettings(
         epochs=args.epochs,
@@ -489,7 +515,7 @@ def main() -> None:
     )
 
     if args.init_from_checkpoint is not None:
-        pipeline.model.load_state_dict(init_checkpoint["model_state"])
+        pipeline.model.load_state_dict(init_checkpoint["model_state"], strict=False)
         print("Model weights initialized from checkpoint. Training will continue from this state.")
 
     llm_requested = bool(pipeline.use_llm_drafts)
@@ -505,7 +531,7 @@ def main() -> None:
         print("LLM drafts are disabled for training/validation/test metrics and enabled only for sample output.")
 
     if checkpoint_mode:
-        pipeline.model.load_state_dict(checkpoint["model_state"])
+        pipeline.model.load_state_dict(checkpoint["model_state"], strict=False)
         class_prob_thresholds = checkpoint_config.get("class_prob_thresholds", {})
         if isinstance(class_prob_thresholds, dict) and class_prob_thresholds:
             pipeline.set_class_prob_thresholds({int(k): float(v) for k, v in class_prob_thresholds.items()})
@@ -702,6 +728,7 @@ def main() -> None:
             "sentence_head_count": pipeline.sentence_head_count,
             "sentence_tail_count": pipeline.sentence_tail_count,
             "sentence_top_k": pipeline.sentence_top_k,
+            "split_target_mode": pipeline.split_target_mode,
         }
 
         print(f"\nSaving model checkpoint to {model_checkpoint_path}...")
