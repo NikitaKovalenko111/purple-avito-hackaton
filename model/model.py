@@ -154,7 +154,7 @@ class TrainingSettings:
     lr: float = 3e-5
     weight_decay: float = 0.01
     split_loss_weight: float = 0.5
-    split_pos_weight: float = 1.0
+    split_pos_weight: float = 3.0
     patience: int = 2
     min_delta: float = 1e-4
     threshold_grid: Tuple[float, ...] = (0.08, 0.12, 0.16, 0.20, 0.24)
@@ -900,7 +900,7 @@ class DraftSplitPipeline:
             source_mc_ids: Sequence[int],
             optimizer: Any,
             split_loss_weight: float = 0.5,
-            split_pos_weight: float = 1.0,
+            split_pos_weight: float = 3.0,
                 cross_encoder_loss_weight: float = 0.5,
     ) -> float:
         if (
@@ -1010,7 +1010,7 @@ class DraftSplitPipeline:
             epochs: int = 1,
             force_include_targets: bool = False,
             split_loss_weight: float = 0.5,
-            split_pos_weight: float = 1.0,
+            split_pos_weight: float = 3.0,
             cross_encoder_loss_weight: float = 0.5,
             verbose: bool = False,
     ) -> List[float]:
