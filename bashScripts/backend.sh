@@ -15,21 +15,22 @@ BACKEND_DIR="$CHECK_DIR/../server"
 
 if command -v python3 &>/dev/null; then
     PY=python3
-    echo "Python установлен(python3)." >&2
+    log_info "Python установлен(python3)." >&2
 elif command -v python &>/dev/null; then
     PY=python
-    echo "Python установлен(python)." >&2
+    log_info "Python установлен(python)." >&2
 else
-    echo "Python не найден. Установите python3." >&2
+    log_error "Python не найден. Установите python3." >&2
     exit 1
 fi
 
-echo "Создание окружения..."
+cd "$BACKEND_DIR" || { log_error "Директория $BACKEND_DIR не найдена"; exit 1; }
 
-cd "$BACKEND_DIR"
-
-$PY -m venv .venv
-source .venv/bin/activate
+if [ ! -d ".venv" ]; then
+    log_info "Создание окружения..."
+    $PY -m venv .venv
+fi
+source .venv/bin/activate || { log_error "Не удалось активировать venv"; exit 1; }
 
 
 
@@ -44,7 +45,3 @@ $PY manage.py migrate
 log_info "Запуск сервера..."
 
 $PY manage.py runserver
-
-cd $OLDPWD
-
-log_info "Сервер запущен"
