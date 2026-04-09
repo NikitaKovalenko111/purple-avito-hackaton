@@ -11,7 +11,7 @@ log_warn()    { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $1" >&2; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPTS_DIR="$SCRIPT_DIR/bashScripts"
+SCRIPTS_DIR="$SCRIPT_DIR/scripts"
 
 cleanup() {
     log_warn "Получен сигнал завершения. Останавливаем сервисы..."

@@ -22,6 +22,3 @@ log_info "Запуск клиента..."
 cd ./client
 npm install 
 npm run dev
-cd ..
-
-log_info "Клиент запущен"
