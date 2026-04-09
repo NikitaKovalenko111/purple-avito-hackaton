@@ -48,6 +48,11 @@
   box-shadow: var(--shadow-light);
 }
 
+.page-header__button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 @media (max-width: 860px) {
   .page-header__nav {
     display: none;

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib
 import json
+import math
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -17,11 +20,13 @@ def _optional_import(module_name: str) -> Any:
 
 torch = _optional_import("torch")
 AdamW = getattr(_optional_import("torch.optim"), "AdamW", None)
+sklearn_model_selection = _optional_import("sklearn.model_selection")
 
 from model import (
     DraftSplitPipeline,
     PipelineSettings,
     TrainingSettings,
+    evaluate_detect_quality,
     evaluate_retrieval_recall,
     evaluate_split_quality,
     evaluate_split_probability_threshold,
@@ -41,12 +46,23 @@ def _require_torch() -> None:
         raise ImportError("PyTorch is required. Install with: pip install torch")
 
 
+def _require_stratified_kfold() -> None:
+    if sklearn_model_selection is None or not hasattr(sklearn_model_selection, "StratifiedKFold"):
+        raise ImportError("scikit-learn is required for StratifiedKFold. Install with: pip install scikit-learn")
+
+
 DEFAULT_THRESHOLD_GRID: tuple[float, ...] = (0.08, 0.12, 0.16, 0.20, 0.24)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train and evaluate the Avito split-draft pipeline.")
     parser.add_argument("--data-dir", type=Path, default=Path(__file__).resolve().parent / "data")
+    parser.add_argument(
+        "--dataset-file",
+        type=Path,
+        default=None,
+        help="Optional dataset file path (csv/jsonl). Relative paths are resolved against --data-dir.",
+    )
     parser.add_argument("--transformer-name", type=str, default="DeepPavlov/rubert-base-cased")
     parser.add_argument("--tfidf-threshold", type=float, default=0.03)
     parser.add_argument("--tfidf-top-k", type=int, default=11)
@@ -66,71 +82,178 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Blend weight for model score vs TF-IDF score (1.0 = model-only).",
     )
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=3e-5)
     parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--patience", type=int, default=2)
+    parser.add_argument("--patience", type=int, default=3)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument(
+        "--max-length",
+        type=int,
+        default=512,
+        help="Max token length for transformer encoder (recommended 384 for 8GB GPU).",
+    )
+    parser.add_argument(
+        "--long-text-mode",
+        type=str,
+        choices=["head", "head_tail", "chunks"],
+        default="chunks",
+        help="Strategy for long ads: head truncation, head+tail, or chunk windows.",
+    )
+    parser.add_argument(
+        "--long-text-window-tokens",
+        type=int,
+        default=256,
+        help="Chunk window size in tokens for --long-text-mode chunks.",
+    )
+    parser.add_argument(
+        "--long-text-stride-tokens",
+        type=int,
+        default=192,
+        help="Chunk stride in tokens for --long-text-mode chunks.",
+    )
+    parser.add_argument(
+        "--long-text-max-windows",
+        type=int,
+        default=4,
+        help="Max windows per text for --long-text-mode chunks.",
+    )
+    parser.add_argument(
+        "--use-cross-encoder",
+        action="store_true",
+        help="Enable cross-encoder reranking on shortlisted candidates.",
+    )
+    parser.add_argument(
+        "--cross-encoder-alpha",
+        type=float,
+        default=0.5,
+        help="Blend weight for cross-encoder reranking scores.",
+    )
+    parser.add_argument(
+        "--cross-encoder-loss-weight",
+        type=float,
+        default=0.5,
+        help="Loss weight for cross-encoder pairwise training.",
+    )
+    parser.add_argument(
+        "--disable-text-normalization",
+        action="store_true",
+        help="Disable text normalization (emoji/symbol cleanup and whitespace normalization).",
+    )
+    parser.add_argument(
+        "--noise-min-words",
+        type=int,
+        default=3,
+        help="Drop short noisy sentences with fewer than N words.",
+    )
+    parser.add_argument(
+        "--noise-min-unique-ratio",
+        type=float,
+        default=0.35,
+        help="Drop noisy sentences with low unique-word ratio.",
+    )
+    parser.add_argument(
+        "--disable-collapse-repeated-words",
+        action="store_true",
+        help="Disable collapsing repeated neighboring words like 'доставка доставка доставка'.",
+    )
+    parser.add_argument(
+        "--sentence-head-count",
+        type=int,
+        default=1,
+        help="Always keep first N informative sentences.",
+    )
+    parser.add_argument(
+        "--sentence-tail-count",
+        type=int,
+        default=1,
+        help="Always keep last N informative sentences.",
+    )
+    parser.add_argument(
+        "--sentence-top-k",
+        type=int,
+        default=7,
+        help="Keep top-K additional informative sentences by heuristic score.",
+    )
     parser.add_argument(
         "--split-threshold-grid",
         type=float,
         nargs="+",
-        default=[0.35, 0.40, 0.45, 0.50, 0.55, 0.60],
+        default=[0.30, 0.35, 0.40, 0.45, 0.50],
         help="Candidate shouldSplit thresholds to search on validation.",
+    )
+    parser.add_argument(
+        "--split-target-mode",
+        type=str,
+        choices=["auto", "split", "detected"],
+        default="auto",
+        help="Which labels to use as the draft target: raw split labels, detected labels, or auto-detect from data.",
+    )
+    parser.add_argument(
+        "--split-equals-detected-when-should-split",
+        action="store_true",
+        help="If enabled, when shouldSplit=true predicted split categories are set equal to detected categories (excluding source).",
     )
     parser.add_argument(
         "--threshold-grid",
         type=float,
         nargs="+",
-        default=list(DEFAULT_THRESHOLD_GRID),
+        default=[0.03, 0.04, 0.05, 0.06, 0.08, 0.10],
         help="Candidate probability thresholds to search on validation.",
     )
     parser.add_argument(
         "--class-threshold-grid",
         type=float,
         nargs="+",
-        default=list(DEFAULT_THRESHOLD_GRID),
+        default=[0.03, 0.04, 0.05, 0.06, 0.08],
         help="Candidate per-class probability thresholds to search on validation.",
     )
     parser.add_argument(
         "--max-drafts-grid",
         type=int,
         nargs="+",
-        default=[0, 2, 3],
+        default=[0, 3, 5, 7],
         help="Grid for max generated drafts (0 = no cap).",
+    )
+    parser.add_argument(
+        "--top-k-drafts-grid",
+        type=int,
+        nargs="+",
+        default=[3, 5, 7],
+        help="Grid for top-k candidate selection before reranking filters.",
     )
     parser.add_argument(
         "--score-margin-grid",
         type=float,
         nargs="+",
-        default=[1.0, 0.20, 0.12, 0.08],
+        default=[0.30, 0.20, 0.12],
         help="Grid for absolute margin filtering from the top score.",
     )
     parser.add_argument(
         "--relative-ratio-grid",
         type=float,
         nargs="+",
-        default=[0.0, 0.5, 0.7],
+        default=[0.4, 0.6],
         help="Grid for relative top-score ratio filtering.",
     )
     parser.add_argument(
         "--score-blend-alpha-grid",
         type=float,
         nargs="+",
-        default=[1.0, 0.9, 0.8],
+        default=[1.0, 0.9],
         help="Grid for blending transformer and TF-IDF scores.",
     )
     parser.add_argument(
         "--optimize-for",
-        choices=["f1", "precision", "recall"],
+        choices=["f1", "precision", "recall", "composite"],
         default="f1",
-        help="Metric used for threshold/control search on validation.",
+        help="Metric used for threshold/control search on validation (composite = mean of precision, recall, shouldSplit accuracy).",
     )
     parser.add_argument(
         "--min-recall",
         type=float,
-        default=0.0,
+        default=0.45,
         help="Minimum recall constraint during validation searches.",
     )
     parser.add_argument("--use-jsonl", action="store_true", help="Load dataset from JSONL instead of CSV.")
@@ -182,19 +305,149 @@ def parse_args() -> argparse.Namespace:
         help="Path to saved model checkpoint (.pt). If provided, training is skipped.",
     )
     parser.add_argument(
+        "--init-from-checkpoint",
+        type=Path,
+        default=None,
+        help="Path to checkpoint (.pt) to initialize model weights before training.",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path(__file__).resolve().parent / "checkpoints",
         help="Directory to save model checkpoints and results.",
     )
+    parser.add_argument(
+        "--split-pos-weight",
+        type=float,
+        default=3.0,
+        help="Positive class weight for shouldSplit BCE loss (>1 increases split recall).",
+    )
+    parser.add_argument(
+        "--no-early-stopping",
+        action="store_true",
+        help="Train for all epochs without validation-based early stopping.",
+    )
+    parser.add_argument(
+        "--train-stratified-kfold",
+        type=int,
+        default=0,
+        help="If >1, run training with StratifiedKFold by shouldSplit and report aggregated fold metrics.",
+    )
+    parser.add_argument(
+        "--cv-source-split",
+        choices=["train", "train_val", "all"],
+        default="train_val",
+        help="Subset used as pool for KFold training/validation.",
+    )
+    parser.add_argument(
+        "--cv-random-state",
+        type=int,
+        default=42,
+        help="Random state for StratifiedKFold shuffle.",
+    )
+    parser.add_argument(
+        "--balance-should-split-batches",
+        action="store_true",
+        help="Use per-epoch resampling for shouldSplit labels in train batches.",
+    )
+    parser.add_argument(
+        "--batch-false-ratio",
+        type=float,
+        default=0.7,
+        help="Target ratio of shouldSplit=false samples in resampled train epochs.",
+    )
+    parser.add_argument(
+        "--batch-true-ratio",
+        type=float,
+        default=0.3,
+        help="Target ratio of shouldSplit=true samples in resampled train epochs.",
+    )
+    parser.add_argument(
+        "--cv-full-tuning",
+        action="store_true",
+        help="Enable full (slow) k-fold tuning including class-threshold and reranking grid search.",
+    )
+    parser.add_argument(
+        "--cv-fast-threshold-grid",
+        type=float,
+        nargs="+",
+        default=[0.05, 0.08],
+        help="Fast k-fold grid for prob_threshold tuning.",
+    )
+    parser.add_argument(
+        "--cv-fast-split-threshold-grid",
+        type=float,
+        nargs="+",
+        default=[0.35, 0.45],
+        help="Fast k-fold grid for shouldSplit threshold tuning.",
+    )
     return parser.parse_args()
 
 
-def load_items(data_dir: Path, use_jsonl: bool) -> List[object]:
+def _mean(values: List[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _std(values: List[float]) -> float:
+    if len(values) <= 1:
+        return 0.0
+    mean = _mean(values)
+    var = sum((x - mean) ** 2 for x in values) / len(values)
+    return var ** 0.5
+
+
+def _collect_numeric(prefix: str, obj: Any, out: Dict[str, float]) -> None:
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            next_prefix = f"{prefix}.{key}" if prefix else str(key)
+            _collect_numeric(next_prefix, value, out)
+        return
+    if isinstance(obj, (int, float)):
+        out[prefix] = float(obj)
+
+
+def _aggregate_fold_metrics(folds: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
+    series: Dict[str, List[float]] = {}
+    for fold in folds:
+        flat: Dict[str, float] = {}
+        _collect_numeric("", fold, flat)
+        for key, value in flat.items():
+            series.setdefault(key, []).append(value)
+
+    mean_metrics = {k: _mean(v) for k, v in series.items()}
+    std_metrics = {k: _std(v) for k, v in series.items()}
+    return {"mean": mean_metrics, "std": std_metrics}
+
+
+def load_items(data_dir: Path, use_jsonl: bool, dataset_file: Path | None = None) -> List[object]:
+    if dataset_file is not None:
+        dataset_path = dataset_file if dataset_file.is_absolute() else data_dir / dataset_file
+        suffix = dataset_path.suffix.lower()
+        if suffix == ".jsonl":
+            return load_labeled_items_jsonl(str(dataset_path))
+        if suffix == ".csv":
+            return load_labeled_items_csv(str(dataset_path))
+        if use_jsonl:
+            return load_labeled_items_jsonl(str(dataset_path))
+        return load_labeled_items_csv(str(dataset_path))
+
     dataset_path = data_dir / ("rnc_dataset.jsonl" if use_jsonl else "rnc_dataset.csv")
     if use_jsonl:
         return load_labeled_items_jsonl(str(dataset_path))
     return load_labeled_items_csv(str(dataset_path))
+
+
+def infer_split_target_mode(items: List[object]) -> str:
+    has_positive_split = False
+    for item in items:
+        target_split = set(getattr(item, "target_split_mc_ids", []))
+        if not target_split:
+            continue
+        has_positive_split = True
+        target_detected = set(getattr(item, "target_detected_mc_ids", []))
+        if target_split != target_detected:
+            return "split"
+    return "detected" if has_positive_split else "split"
 
 
 def resolve_data_dir(data_dir: Path) -> Path:
@@ -212,9 +465,6 @@ def _load_checkpoint(checkpoint_path: Path) -> Dict[str, Any]:
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
-    # PyTorch 2.6 changed default torch.load(..., weights_only=True).
-    # Our checkpoints include metadata (e.g. custom classes), so we fall back
-    # to weights_only=False for trusted local files.
     try:
         checkpoint = torch.load(str(checkpoint_path), map_location="cpu")
     except Exception as exc:
@@ -243,26 +493,32 @@ def _load_env_file(env_path: Path) -> None:
             if not key:
                 continue
 
-            # Do not override already exported environment variables.
             os.environ.setdefault(key, value)
 
 
 def main() -> None:
     _require_torch()
 
-    # Support local secrets/config via .env without external dependencies.
     project_root = Path(__file__).resolve().parent.parent
     _load_env_file(project_root / ".env")
 
     args = parse_args()
+    if args.checkpoint_path is not None and args.init_from_checkpoint is not None:
+        raise ValueError("Use either --checkpoint-path or --init-from-checkpoint, not both.")
+
     checkpoint_mode = args.checkpoint_path is not None
     checkpoint: Dict[str, Any] = {}
     checkpoint_config: Dict[str, Any] = {}
+    init_checkpoint: Dict[str, Any] = {}
 
     if checkpoint_mode:
         print(f"Loading checkpoint from {args.checkpoint_path}...")
         checkpoint = _load_checkpoint(args.checkpoint_path)
         checkpoint_config = checkpoint.get("config", {}) if isinstance(checkpoint.get("config"), dict) else {}
+
+    if args.init_from_checkpoint is not None:
+        print(f"Loading initialization checkpoint from {args.init_from_checkpoint}...")
+        init_checkpoint = _load_checkpoint(args.init_from_checkpoint)
 
     data_dir = resolve_data_dir(args.data_dir)
 
@@ -271,8 +527,13 @@ def main() -> None:
     print(f"Loading microcategories from {micro_path}...")
     microcategories = load_microcategories_from_csv(str(micro_path))
     print(f"Loading dataset ({dataset_label}) from {data_dir}...")
-    items = load_items(data_dir, args.use_jsonl)
+    items = load_items(data_dir, args.use_jsonl, args.dataset_file)
     buckets = split_dataset(items)
+    inferred_split_target_mode = infer_split_target_mode(items)
+    split_target_mode = (
+        inferred_split_target_mode if args.split_target_mode == "auto" else args.split_target_mode
+    )
+    print(f"Split target mode: {split_target_mode} (inferred={inferred_split_target_mode})")
 
     train_items = buckets.get("train", [])
     val_items = buckets.get("val", [])
@@ -293,6 +554,23 @@ def main() -> None:
         score_margin=float(checkpoint_config.get("score_margin", args.score_margin)),
         relative_ratio=float(checkpoint_config.get("relative_ratio", args.relative_ratio)),
         score_blend_alpha=float(checkpoint_config.get("score_blend_alpha", args.score_blend_alpha)),
+        max_length=int(checkpoint_config.get("max_length", args.max_length)),
+        long_text_mode=str(checkpoint_config.get("long_text_mode", args.long_text_mode)),
+        long_text_window_tokens=int(
+            checkpoint_config.get("long_text_window_tokens", args.long_text_window_tokens)
+        ),
+        long_text_stride_tokens=int(
+            checkpoint_config.get("long_text_stride_tokens", args.long_text_stride_tokens)
+        ),
+        long_text_max_windows=int(
+            checkpoint_config.get("long_text_max_windows", args.long_text_max_windows)
+        ),
+        top_k_drafts=int(checkpoint_config.get("top_k_drafts", 5)),
+        use_cross_encoder=bool(checkpoint_config.get("use_cross_encoder", args.use_cross_encoder)),
+        cross_encoder_alpha=float(checkpoint_config.get("cross_encoder_alpha", args.cross_encoder_alpha)),
+        cross_encoder_loss_weight=float(
+            checkpoint_config.get("cross_encoder_loss_weight", args.cross_encoder_loss_weight)
+        ),
         device=args.device,
         use_llm_drafts=use_llm_drafts,
         openrouter_model=str(args.openrouter_model),
@@ -301,6 +579,24 @@ def main() -> None:
         openrouter_timeout_sec=float(args.openrouter_timeout_sec),
         openrouter_site_url=args.openrouter_site_url,
         openrouter_app_name=str(args.openrouter_app_name),
+        normalize_text=bool(checkpoint_config.get("normalize_text", not args.disable_text_normalization)),
+        noise_min_words=int(checkpoint_config.get("noise_min_words", args.noise_min_words)),
+        noise_min_unique_ratio=float(
+            checkpoint_config.get("noise_min_unique_ratio", args.noise_min_unique_ratio)
+        ),
+        collapse_repeated_words=bool(
+            checkpoint_config.get("collapse_repeated_words", not args.disable_collapse_repeated_words)
+        ),
+        sentence_head_count=int(checkpoint_config.get("sentence_head_count", args.sentence_head_count)),
+        sentence_tail_count=int(checkpoint_config.get("sentence_tail_count", args.sentence_tail_count)),
+        sentence_top_k=int(checkpoint_config.get("sentence_top_k", args.sentence_top_k)),
+        split_target_mode=str(checkpoint_config.get("split_target_mode", split_target_mode)),
+        split_equals_detected_when_should_split=bool(
+            checkpoint_config.get(
+                "split_equals_detected_when_should_split",
+                args.split_equals_detected_when_should_split,
+            )
+        ),
     )
     training_settings = TrainingSettings(
         epochs=args.epochs,
@@ -308,15 +604,377 @@ def main() -> None:
         lr=args.lr,
         weight_decay=args.weight_decay,
         patience=args.patience,
+        split_pos_weight=float(args.split_pos_weight),
         threshold_grid=tuple(args.threshold_grid),
+        split_threshold_grid=tuple(args.split_threshold_grid),
+        optimize_for=args.optimize_for,
+        min_recall=float(args.min_recall),
+        cross_encoder_loss_weight=float(args.cross_encoder_loss_weight),
+        balance_should_split_batches=bool(args.balance_should_split_batches),
+        batch_false_ratio=float(args.batch_false_ratio),
+        batch_true_ratio=float(args.batch_true_ratio),
     )
+
+    if args.train_stratified_kfold > 1:
+        if checkpoint_mode:
+            raise ValueError("--train-stratified-kfold cannot be used with --checkpoint-path (training is skipped in checkpoint mode).")
+
+        _require_stratified_kfold()
+
+        if args.cv_source_split == "train":
+            cv_pool = list(train_items)
+        elif args.cv_source_split == "all":
+            cv_pool = list(items)
+        else:
+            cv_pool = list(train_items) + list(val_items)
+
+        if not cv_pool:
+            raise ValueError(f"No data available for CV pool='{args.cv_source_split}'.")
+
+        cv_labels = [1 if bool(x.should_split) else 0 for x in cv_pool]
+        positives = sum(cv_labels)
+        negatives = len(cv_labels) - positives
+        if positives < args.train_stratified_kfold or negatives < args.train_stratified_kfold:
+            raise ValueError(
+                "Not enough samples per class for StratifiedKFold: "
+                f"positives={positives}, negatives={negatives}, n_splits={args.train_stratified_kfold}"
+            )
+
+        skf = sklearn_model_selection.StratifiedKFold(
+            n_splits=args.train_stratified_kfold,
+            shuffle=True,
+            random_state=args.cv_random_state,
+        )
+
+        fold_reports: List[Dict[str, Any]] = []
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        cv_report_path = output_dir / "cv_training_report.json"
+
+        print(
+            f"Running StratifiedKFold training: n_splits={args.train_stratified_kfold}, "
+            f"pool={args.cv_source_split}, size={len(cv_pool)}"
+        )
+
+        if args.cv_full_tuning:
+            fold_training_settings = replace(training_settings)
+            print("KFold tuning mode: full (slow)")
+        else:
+            fold_training_settings = replace(
+                training_settings,
+                threshold_grid=tuple(args.cv_fast_threshold_grid),
+                split_threshold_grid=tuple(args.cv_fast_split_threshold_grid),
+            )
+            print(
+                "KFold tuning mode: fast | "
+                f"threshold_grid={list(fold_training_settings.threshold_grid)} | "
+                f"split_threshold_grid={list(fold_training_settings.split_threshold_grid)}"
+            )
+
+        print("Initializing fold pipeline once (model/tokenizer load)...")
+        fold_pipeline = DraftSplitPipeline(
+            microcategories=microcategories,
+            settings=replace(pipeline_settings),
+        )
+        if args.init_from_checkpoint is not None:
+            fold_pipeline.model.load_state_dict(init_checkpoint["model_state"], strict=False)
+        fold_pipeline.use_llm_drafts = False
+
+        base_model_state = copy.deepcopy(fold_pipeline.model.state_dict())
+        base_class_thresholds = dict(fold_pipeline.class_prob_thresholds)
+        best_fold_score = -1.0
+        best_fold_index = 0
+        best_fold_checkpoint_path = output_dir / "cv_best_fold_checkpoint.pt"
+
+        for fold_idx, (fold_train_idx, fold_val_idx) in enumerate(skf.split(cv_pool, cv_labels), start=1):
+            fold_train_items = [cv_pool[i] for i in fold_train_idx]
+            fold_val_items = [cv_pool[i] for i in fold_val_idx]
+
+            fold_pipeline.model.load_state_dict(base_model_state, strict=True)
+            fold_pipeline.model.train()
+            fold_pipeline.prob_threshold = float(pipeline_settings.prob_threshold)
+            fold_pipeline.split_threshold = float(pipeline_settings.split_threshold)
+            fold_pipeline.top_k_drafts = int(pipeline_settings.top_k_drafts)
+            fold_pipeline.class_prob_thresholds = dict(base_class_thresholds)
+            fold_pipeline.set_reranking_controls(
+                max_drafts=int(pipeline_settings.max_drafts),
+                score_margin=float(pipeline_settings.score_margin),
+                relative_ratio=float(pipeline_settings.relative_ratio),
+                score_blend_alpha=float(pipeline_settings.score_blend_alpha),
+            )
+            fold_optimizer = AdamW(
+                fold_pipeline.model.parameters(),
+                lr=training_settings.lr,
+                weight_decay=training_settings.weight_decay,
+            )
+
+            print(
+                f"\n[Fold {fold_idx}/{args.train_stratified_kfold}] "
+                f"train={len(fold_train_items)} val={len(fold_val_items)}"
+            )
+
+            if args.no_early_stopping:
+                fold_pipeline.train_on_labeled_items(
+                    items=fold_train_items,
+                    optimizer=fold_optimizer,
+                    batch_size=fold_training_settings.batch_size,
+                    epochs=fold_training_settings.epochs,
+                    split_loss_weight=fold_training_settings.split_loss_weight,
+                    split_pos_weight=fold_training_settings.split_pos_weight,
+                    cross_encoder_loss_weight=fold_training_settings.cross_encoder_loss_weight,
+                    balance_should_split_batches=fold_training_settings.balance_should_split_batches,
+                    batch_false_ratio=fold_training_settings.batch_false_ratio,
+                    batch_true_ratio=fold_training_settings.batch_true_ratio,
+                    verbose=True,
+                )
+            else:
+                fold_pipeline.fit_with_early_stopping(
+                    train_items=fold_train_items,
+                    val_items=fold_val_items,
+                    optimizer=fold_optimizer,
+                    training_settings=fold_training_settings,
+                )
+
+            print(f"[Fold {fold_idx}] tuning prob_threshold...")
+            fold_threshold_report = search_best_probability_threshold(
+                fold_pipeline,
+                fold_val_items,
+                fold_training_settings.threshold_grid,
+                optimize_for=args.optimize_for,
+                min_recall=args.min_recall,
+            )
+            fold_pipeline.prob_threshold = fold_threshold_report["threshold"]
+
+            print(f"[Fold {fold_idx}] tuning split_threshold...")
+            fold_split_threshold_report = evaluate_split_probability_threshold(
+                fold_pipeline,
+                fold_val_items,
+                fold_training_settings.split_threshold_grid,
+                optimize_for=args.optimize_for,
+                min_recall=args.min_recall,
+            )
+            fold_pipeline.split_threshold = fold_split_threshold_report["threshold"]
+
+            if args.cv_full_tuning:
+                print(f"[Fold {fold_idx}] tuning class thresholds...")
+                fold_class_threshold_report = search_best_class_probability_thresholds(
+                    fold_pipeline,
+                    fold_val_items,
+                    args.class_threshold_grid,
+                    optimize_for=args.optimize_for,
+                    min_recall=args.min_recall,
+                )
+                fold_pipeline.set_class_prob_thresholds(fold_class_threshold_report["class_thresholds"])
+
+                print(f"[Fold {fold_idx}] tuning reranking controls...")
+                fold_reranking_report = search_best_reranking_controls(
+                    fold_pipeline,
+                    fold_val_items,
+                    args.top_k_drafts_grid,
+                    args.max_drafts_grid,
+                    args.score_margin_grid,
+                    args.relative_ratio_grid,
+                    args.score_blend_alpha_grid,
+                    optimize_for=args.optimize_for,
+                    min_recall=args.min_recall,
+                )
+                fold_best_controls = fold_reranking_report["best_controls"]
+                fold_pipeline.top_k_drafts = fold_best_controls["top_k_drafts"]
+                fold_pipeline.set_reranking_controls(
+                    max_drafts=fold_best_controls["max_drafts"],
+                    score_margin=fold_best_controls["score_margin"],
+                    relative_ratio=fold_best_controls["relative_ratio"],
+                    score_blend_alpha=fold_best_controls["score_blend_alpha"],
+                )
+
+            fold_split_metrics = evaluate_split_quality(fold_pipeline, fold_val_items)
+            fold_detect_metrics = evaluate_detect_quality(fold_pipeline, fold_val_items)
+            fold_retrieval_recall = evaluate_retrieval_recall(fold_pipeline, fold_val_items)
+
+            fold_report = {
+                "fold": fold_idx,
+                "train_size": len(fold_train_items),
+                "val_size": len(fold_val_items),
+                "thresholds": {
+                    "prob_threshold": fold_pipeline.prob_threshold,
+                    "split_threshold": fold_pipeline.split_threshold,
+                },
+                "split_metrics": fold_split_metrics,
+                "detect_metrics": fold_detect_metrics,
+                "retrieval_recall": fold_retrieval_recall,
+            }
+            fold_reports.append(fold_report)
+
+            raw_fold_score = float(fold_split_metrics.get("f1_micro", 0.0))
+            fold_score = raw_fold_score if math.isfinite(raw_fold_score) else float("-inf")
+            if not math.isfinite(raw_fold_score):
+                print(f"[Fold {fold_idx}] warning: non-finite split_f1={raw_fold_score}; using -inf for best-fold selection")
+
+            should_update_best = fold_idx == 1 or (not best_fold_checkpoint_path.exists()) or (fold_score > best_fold_score)
+            if should_update_best:
+                best_fold_score = fold_score
+                best_fold_index = fold_idx
+                torch.save(
+                    {
+                        "model_state": fold_pipeline.model.state_dict(),
+                        "config": {
+                            "transformer_name": transformer_name,
+                            "prob_threshold": fold_pipeline.prob_threshold,
+                            "split_threshold": fold_pipeline.split_threshold,
+                            "class_prob_thresholds": fold_pipeline.class_prob_thresholds,
+                            "max_drafts": fold_pipeline.max_drafts,
+                            "score_margin": fold_pipeline.score_margin,
+                            "relative_ratio": fold_pipeline.relative_ratio,
+                            "score_blend_alpha": fold_pipeline.score_blend_alpha,
+                            "top_k_drafts": fold_pipeline.top_k_drafts,
+                            "split_target_mode": fold_pipeline.split_target_mode,
+                            "split_equals_detected_when_should_split": fold_pipeline.split_equals_detected_when_should_split,
+                        },
+                        "transformer_name": transformer_name,
+                        "microcategories": microcategories,
+                        "best_fold": best_fold_index,
+                        "best_fold_f1": best_fold_score,
+                    },
+                    str(best_fold_checkpoint_path),
+                )
+
+            partial_aggregate = _aggregate_fold_metrics(fold_reports)
+            with cv_report_path.open("w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "mode": "train_stratified_kfold",
+                        "status": "in_progress",
+                        "n_splits": args.train_stratified_kfold,
+                        "cv_source_split": args.cv_source_split,
+                        "cv_random_state": args.cv_random_state,
+                        "completed_folds": len(fold_reports),
+                        "best_fold": best_fold_index,
+                        "best_fold_f1": best_fold_score,
+                        "folds": fold_reports,
+                        "aggregate": partial_aggregate,
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+
+            print(
+                f"[Fold {fold_idx}] split_f1={fold_split_metrics['f1_micro']:.4f} "
+                f"shouldSplit_acc={fold_split_metrics['should_split_accuracy']:.4f} "
+                f"detect_f1={fold_detect_metrics['f1_micro']:.4f}"
+            )
+
+        aggregate = _aggregate_fold_metrics(fold_reports)
+        print("\nStratifiedKFold aggregate mean ± std:")
+        for key, mean_value in sorted(aggregate["mean"].items()):
+            std_value = aggregate["std"].get(key, 0.0)
+            print(f"  {key}: {mean_value:.4f} ± {std_value:.4f}")
+
+        post_cv_report: Dict[str, Any] = {}
+        if best_fold_checkpoint_path.exists():
+            print("\nPost-CV: loading best fold checkpoint for full tuning + test...")
+            best_checkpoint = _load_checkpoint(best_fold_checkpoint_path)
+            fold_pipeline.model.load_state_dict(best_checkpoint["model_state"], strict=False)
+            fold_pipeline.model.eval()
+
+            if val_items:
+                print("Post-CV: full threshold tuning on validation split...")
+                threshold_report = search_best_probability_threshold(
+                    fold_pipeline,
+                    val_items,
+                    training_settings.threshold_grid,
+                    optimize_for=args.optimize_for,
+                    min_recall=args.min_recall,
+                )
+                fold_pipeline.prob_threshold = threshold_report["threshold"]
+
+                split_threshold_report = evaluate_split_probability_threshold(
+                    fold_pipeline,
+                    val_items,
+                    args.split_threshold_grid,
+                    optimize_for=args.optimize_for,
+                    min_recall=args.min_recall,
+                )
+                fold_pipeline.split_threshold = split_threshold_report["threshold"]
+
+                class_threshold_report = search_best_class_probability_thresholds(
+                    fold_pipeline,
+                    val_items,
+                    args.class_threshold_grid,
+                    optimize_for=args.optimize_for,
+                    min_recall=args.min_recall,
+                )
+                fold_pipeline.set_class_prob_thresholds(class_threshold_report["class_thresholds"])
+
+                reranking_report = search_best_reranking_controls(
+                    fold_pipeline,
+                    val_items,
+                    args.top_k_drafts_grid,
+                    args.max_drafts_grid,
+                    args.score_margin_grid,
+                    args.relative_ratio_grid,
+                    args.score_blend_alpha_grid,
+                    optimize_for=args.optimize_for,
+                    min_recall=args.min_recall,
+                )
+                best_controls = reranking_report["best_controls"]
+                fold_pipeline.top_k_drafts = best_controls["top_k_drafts"]
+                fold_pipeline.set_reranking_controls(
+                    max_drafts=best_controls["max_drafts"],
+                    score_margin=best_controls["score_margin"],
+                    relative_ratio=best_controls["relative_ratio"],
+                    score_blend_alpha=best_controls["score_blend_alpha"],
+                )
+
+                post_cv_report["val"] = {
+                    "threshold_report": threshold_report,
+                    "split_threshold_report": split_threshold_report,
+                    "class_threshold_report": class_threshold_report,
+                    "reranking_report": reranking_report,
+                    "split_metrics": evaluate_split_quality(fold_pipeline, val_items),
+                    "detect_metrics": evaluate_detect_quality(fold_pipeline, val_items),
+                    "retrieval_recall": evaluate_retrieval_recall(fold_pipeline, val_items),
+                }
+
+            if test_items:
+                print(f"Post-CV: test evaluation ({len(test_items)} items)...")
+                post_cv_report["test"] = {
+                    "split_metrics": evaluate_split_quality(fold_pipeline, test_items),
+                    "detect_metrics": evaluate_detect_quality(fold_pipeline, test_items),
+                    "retrieval_recall": evaluate_retrieval_recall(fold_pipeline, test_items),
+                }
+
+        with cv_report_path.open("w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "mode": "train_stratified_kfold",
+                    "status": "completed",
+                    "n_splits": args.train_stratified_kfold,
+                    "cv_source_split": args.cv_source_split,
+                    "cv_random_state": args.cv_random_state,
+                    "best_fold": best_fold_index,
+                    "best_fold_f1": best_fold_score,
+                    "folds": fold_reports,
+                    "aggregate": aggregate,
+                    "post_cv": post_cv_report,
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+        print(f"CV report saved to {cv_report_path}")
+        return
 
     pipeline = DraftSplitPipeline(
         microcategories=microcategories,
         settings=pipeline_settings,
     )
+
+    if args.init_from_checkpoint is not None:
+        pipeline.model.load_state_dict(init_checkpoint["model_state"], strict=False)
+        print("Model weights initialized from checkpoint. Training will continue from this state.")
+
     llm_requested = bool(pipeline.use_llm_drafts)
-    # Metrics should be deterministic and fast: avoid LLM calls on full val/test sets.
     pipeline.use_llm_drafts = False
     print(f"LLM drafts enabled: {llm_requested}")
     if llm_requested:
@@ -324,11 +982,10 @@ def main() -> None:
         print(f"OpenRouter API key present: {bool(pipeline.openrouter_api_key)}")
 
     if not checkpoint_mode and llm_requested:
-        # Keep training/tuning deterministic and fast: use template drafts in this phase.
         print("LLM drafts are disabled for training/validation/test metrics and enabled only for sample output.")
 
     if checkpoint_mode:
-        pipeline.model.load_state_dict(checkpoint["model_state"])
+        pipeline.model.load_state_dict(checkpoint["model_state"], strict=False)
         class_prob_thresholds = checkpoint_config.get("class_prob_thresholds", {})
         if isinstance(class_prob_thresholds, dict) and class_prob_thresholds:
             pipeline.set_class_prob_thresholds({int(k): float(v) for k, v in class_prob_thresholds.items()})
@@ -340,15 +997,46 @@ def main() -> None:
     if checkpoint_mode:
         print("Skipping training because --checkpoint-path is provided.")
     elif train_items and val_items:
-        print("Training with early stopping...")
-        fit_report = pipeline.fit_with_early_stopping(
-            train_items=train_items,
-            val_items=val_items,
-            optimizer=optimizer,
-            training_settings=training_settings,
-        )
-        print("Training report:")
-        print(json.dumps(fit_report, ensure_ascii=False, indent=2))
+        if args.no_early_stopping:
+            print("Training without early stopping...")
+            losses: List[float] = []
+            for epoch in range(1, training_settings.epochs + 1):
+                epoch_loss = pipeline.train_on_labeled_items(
+                    items=train_items,
+                    optimizer=optimizer,
+                    batch_size=training_settings.batch_size,
+                    epochs=1,
+                    split_loss_weight=training_settings.split_loss_weight,
+                    split_pos_weight=training_settings.split_pos_weight,
+                    cross_encoder_loss_weight=training_settings.cross_encoder_loss_weight,
+                    balance_should_split_batches=training_settings.balance_should_split_batches,
+                    batch_false_ratio=training_settings.batch_false_ratio,
+                    batch_true_ratio=training_settings.batch_true_ratio,
+                    verbose=False,
+                )[-1]
+                losses.append(epoch_loss)
+                val_metrics = evaluate_split_quality(pipeline, val_items)
+                print(
+                    f"Epoch {epoch}/{training_settings.epochs} | "
+                    f"train_loss={epoch_loss:.4f} | "
+                    f"val_f1={val_metrics['f1_micro']:.4f} | "
+                    f"val_precision={val_metrics['precision_micro']:.4f} | "
+                    f"val_recall={val_metrics['recall_micro']:.4f} | "
+                    f"shouldSplit_acc={val_metrics['should_split_accuracy']:.4f} | "
+                    f"threshold={pipeline.prob_threshold:.2f} | "
+                    f"split_threshold={pipeline.split_threshold:.2f}"
+                )
+            print(f"Loss history: {losses}")
+        else:
+            print("Training with early stopping...")
+            fit_report = pipeline.fit_with_early_stopping(
+                train_items=train_items,
+                val_items=val_items,
+                optimizer=optimizer,
+                training_settings=training_settings,
+            )
+            print("Training report:")
+            print(json.dumps(fit_report, ensure_ascii=False, indent=2))
     elif train_items:
         print("Training without validation set...")
         losses = pipeline.train_on_labeled_items(
@@ -356,6 +1044,12 @@ def main() -> None:
             optimizer=optimizer,
             batch_size=training_settings.batch_size,
             epochs=training_settings.epochs,
+            split_loss_weight=training_settings.split_loss_weight,
+            split_pos_weight=training_settings.split_pos_weight,
+            balance_should_split_batches=training_settings.balance_should_split_batches,
+            batch_false_ratio=training_settings.batch_false_ratio,
+            batch_true_ratio=training_settings.batch_true_ratio,
+            verbose=True,
         )
         print(f"Loss history: {losses}")
     else:
@@ -364,6 +1058,8 @@ def main() -> None:
     if val_items and checkpoint_mode:
         print("Validation metrics (loaded checkpoint):")
         print(json.dumps(evaluate_split_quality(pipeline, val_items), ensure_ascii=False, indent=2))
+        print("Validation detect metrics:")
+        print(json.dumps(evaluate_detect_quality(pipeline, val_items), ensure_ascii=False, indent=2))
         print(f"Retrieval recall on val: {evaluate_retrieval_recall(pipeline, val_items):.4f}")
     elif val_items:
         print("Validation metrics with tuned threshold:")
@@ -377,7 +1073,13 @@ def main() -> None:
         print(json.dumps(threshold_report, ensure_ascii=False, indent=2))
         pipeline.prob_threshold = threshold_report["threshold"]
 
-        split_threshold_report = evaluate_split_probability_threshold(pipeline, val_items, args.split_threshold_grid)
+        split_threshold_report = evaluate_split_probability_threshold(
+            pipeline,
+            val_items,
+            args.split_threshold_grid,
+            optimize_for=args.optimize_for,
+            min_recall=args.min_recall,
+        )
         print("Validation split-threshold tuning:")
         print(json.dumps(split_threshold_report, ensure_ascii=False, indent=2))
         pipeline.split_threshold = split_threshold_report["threshold"]
@@ -397,6 +1099,7 @@ def main() -> None:
         reranking_report = search_best_reranking_controls(
             pipeline,
             val_items,
+            args.top_k_drafts_grid,
             args.max_drafts_grid,
             args.score_margin_grid,
             args.relative_ratio_grid,
@@ -416,12 +1119,16 @@ def main() -> None:
         print(f"Retrieval recall on val: {evaluate_retrieval_recall(pipeline, val_items):.4f}")
         print("Final val metrics:")
         print(json.dumps(evaluate_split_quality(pipeline, val_items), ensure_ascii=False, indent=2))
+        print("Final val detect metrics:")
+        print(json.dumps(evaluate_detect_quality(pipeline, val_items), ensure_ascii=False, indent=2))
 
     if test_items:
         print(f"\nTest set evaluation ({len(test_items)} items):")
         test_metrics = evaluate_split_quality(pipeline, test_items)
         print("Test metrics:")
         print(json.dumps(test_metrics, ensure_ascii=False, indent=2))
+        print("Test detect metrics:")
+        print(json.dumps(evaluate_detect_quality(pipeline, test_items), ensure_ascii=False, indent=2))
         
         print(f"\nRetreval recall on test: {evaluate_retrieval_recall(pipeline, test_items):.4f}")
         
@@ -441,7 +1148,6 @@ def main() -> None:
         print(json.dumps(pipeline.get_llm_diagnostics(), ensure_ascii=False, indent=2))
 
     if not checkpoint_mode:
-        # Save model checkpoint
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         model_checkpoint_path = output_dir / "model_checkpoint.pt"
@@ -456,6 +1162,15 @@ def main() -> None:
             "score_margin": pipeline.score_margin,
             "relative_ratio": pipeline.relative_ratio,
             "score_blend_alpha": pipeline.score_blend_alpha,
+            "max_length": args.max_length,
+            "long_text_mode": pipeline.model.long_text_mode,
+            "long_text_window_tokens": pipeline.model.long_text_window_tokens,
+            "long_text_stride_tokens": pipeline.model.long_text_stride_tokens,
+            "long_text_max_windows": pipeline.model.long_text_max_windows,
+            "top_k_drafts": pipeline.top_k_drafts,
+            "use_cross_encoder": pipeline.use_cross_encoder,
+            "cross_encoder_alpha": pipeline.cross_encoder_alpha,
+            "cross_encoder_loss_weight": pipeline.cross_encoder_loss_weight,
             "class_prob_thresholds": pipeline.class_prob_thresholds,
             "use_llm_drafts": llm_requested,
             "openrouter_model": pipeline.openrouter_model,
@@ -463,6 +1178,15 @@ def main() -> None:
             "openrouter_timeout_sec": pipeline.openrouter_timeout_sec,
             "openrouter_site_url": pipeline.openrouter_site_url,
             "openrouter_app_name": pipeline.openrouter_app_name,
+            "normalize_text": pipeline.normalize_text,
+            "noise_min_words": pipeline.noise_min_words,
+            "noise_min_unique_ratio": pipeline.noise_min_unique_ratio,
+            "collapse_repeated_words": pipeline.collapse_repeated_words,
+            "sentence_head_count": pipeline.sentence_head_count,
+            "sentence_tail_count": pipeline.sentence_tail_count,
+            "sentence_top_k": pipeline.sentence_top_k,
+            "split_target_mode": pipeline.split_target_mode,
+            "split_equals_detected_when_should_split": pipeline.split_equals_detected_when_should_split,
         }
 
         print(f"\nSaving model checkpoint to {model_checkpoint_path}...")
@@ -477,7 +1201,6 @@ def main() -> None:
         )
         print("Model saved")
 
-        # Save pipeline settings as JSON for reference
         settings_path = output_dir / "pipeline_settings.json"
         settings_json = checkpoint_config
         with open(settings_path, "w", encoding="utf-8") as f:

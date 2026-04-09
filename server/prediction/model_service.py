@@ -20,11 +20,12 @@ from model.model import (
 
 try:
     import torch
-except Exception:  # pragma: no cover
+except Exception:
     torch = None
 
 MICRO_CATEGORIES_CSV = ROOT_DIR / "model" / "data" / "rnc_mic_key_phrases.csv"
 DEFAULT_CHECKPOINT_PATH = ROOT_DIR / "model" / "checkpoints" / "model_checkpoint.pt"
+CV_BEST_CHECKPOINT_PATH = ROOT_DIR / "model" / "checkpoints" / "cv_best_fold_checkpoint.pt"
 
 _pipeline = None
 _micro_by_id = {}
@@ -35,17 +36,13 @@ def _load_checkpoint(checkpoint_path: Path) -> dict:
     if torch is None:
         raise RuntimeError("PyTorch is required to load model checkpoint")
 
-    # Prefer safe tensor-only load to avoid legacy pickle symbol issues.
     try:
         return torch.load(str(checkpoint_path), map_location="cpu", weights_only=True)
     except TypeError:
-        # Older torch versions may not support weights_only argument.
         pass
     except Exception:
         pass
 
-    # Backward-compatible fallback for legacy checkpoints that pickle dataclasses
-    # under module name "model" instead of "model.model".
     legacy_model_module = sys.modules.get("model")
     if legacy_model_module is not None:
         setattr(legacy_model_module, "MicroCategory", MicroCategory)
@@ -55,6 +52,20 @@ def _load_checkpoint(checkpoint_path: Path) -> dict:
         setattr(legacy_model_module, "PipelineSettings", PipelineSettings)
 
     return torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
+
+
+def _resolve_default_checkpoint_path() -> Path:
+    env_path = os.getenv("MODEL_CHECKPOINT_PATH")
+    if env_path:
+        return Path(env_path)
+
+    if DEFAULT_CHECKPOINT_PATH.exists():
+        return DEFAULT_CHECKPOINT_PATH
+
+    if CV_BEST_CHECKPOINT_PATH.exists():
+        return CV_BEST_CHECKPOINT_PATH
+
+    return DEFAULT_CHECKPOINT_PATH
 
 
 def get_pipeline():
@@ -70,7 +81,7 @@ def get_pipeline():
         microcategories = load_microcategories_from_csv(str(MICRO_CATEGORIES_CSV))
         _micro_by_id = {mc.mc_id: mc for mc in microcategories}
 
-        checkpoint_path = Path(os.getenv("MODEL_CHECKPOINT_PATH", str(DEFAULT_CHECKPOINT_PATH)))
+        checkpoint_path = _resolve_default_checkpoint_path()
         checkpoint = {}
         checkpoint_config = {}
         if checkpoint_path.exists():
@@ -100,6 +111,9 @@ def get_pipeline():
             score_blend_alpha=float(checkpoint_config.get("score_blend_alpha", 1.0)),
             max_drafts=int(checkpoint_config.get("max_drafts", 0)),
             split_target_mode=str(checkpoint_config.get("split_target_mode", "split")),
+            split_equals_detected_when_should_split=bool(
+                checkpoint_config.get("split_equals_detected_when_should_split", False)
+            ),
         )
 
         _pipeline = DraftSplitPipeline(
@@ -135,7 +149,7 @@ def run_prediction(payload: dict) -> dict:
     pipeline = get_pipeline()
 
     item = Item(
-        item_id=payload["itemId"],
+        item_id=0,
         mc_id=payload["sourceMcId"],
         mc_title=payload["sourceMcTitle"],
         description=payload["description"],
@@ -143,7 +157,32 @@ def run_prediction(payload: dict) -> dict:
 
     result = pipeline.predict(item)
 
-    detected_mc_ids = result.detected_mc_ids
+    ranked_detected = sorted(
+        (
+            (mc_id, float(score))
+            for mc_id, score in result.probabilities.items()
+            if int(mc_id) != int(item.mc_id)
+        ),
+        key=lambda x: x[1],
+        reverse=True,
+    )
+
+    detected_mc_ids = [
+        mc_id
+        for mc_id, score in ranked_detected
+        if score >= pipeline.get_class_prob_threshold(mc_id)
+    ]
+
+    if not detected_mc_ids and ranked_detected:
+        # Keep at least one best candidate for UX stability.
+        detected_mc_ids = [ranked_detected[0][0]]
+
+    if pipeline.top_k_drafts > 0:
+        detected_mc_ids = detected_mc_ids[: pipeline.top_k_drafts]
+
+    if pipeline.max_drafts > 0:
+        detected_mc_ids = detected_mc_ids[: pipeline.max_drafts]
+
     should_split = result.should_split
 
     split_categories = [
@@ -153,6 +192,10 @@ def run_prediction(payload: dict) -> dict:
         }
         for draft in result.drafts
     ]
+
+    if should_split and split_categories:
+        # Keep detected IDs consistent with produced split drafts in split mode.
+        detected_mc_ids = list(dict.fromkeys(int(category["mcId"]) for category in split_categories))
 
     return {
         "detectedMcIds": detected_mc_ids,

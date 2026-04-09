@@ -8,6 +8,9 @@ import importlib
 import itertools
 import json
 import os
+import random
+import re
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib import error as urllib_error
@@ -44,6 +47,32 @@ def _require_sklearn() -> None:
 def _require_transformers() -> None:
     if AutoModel is None or AutoTokenizer is None:
         raise ImportError("transformers is required. Install with: pip install transformers")
+
+
+def _load_tokenizer(model_name: str) -> Any:
+    try:
+        return AutoTokenizer.from_pretrained(model_name, local_files_only=True)
+    except Exception as local_exc:
+        try:
+            return AutoTokenizer.from_pretrained(model_name)
+        except Exception as online_exc:
+            raise RuntimeError(
+                f"Failed to load tokenizer for '{model_name}'. "
+                "Make sure the model is cached locally or the Hugging Face API is reachable."
+            ) from online_exc
+
+
+def _load_text_encoder(model_name: str) -> Any:
+    try:
+        return AutoModel.from_pretrained(model_name, local_files_only=True)
+    except Exception as local_exc:
+        try:
+            return AutoModel.from_pretrained(model_name)
+        except Exception as online_exc:
+            raise RuntimeError(
+                f"Failed to load encoder for '{model_name}'. "
+                "Make sure the model is cached locally or the Hugging Face API is reachable."
+            ) from online_exc
 
 
 @dataclass
@@ -106,6 +135,44 @@ class PipelineSettings:
     openrouter_timeout_sec: float = 30.0
     openrouter_site_url: Optional[str] = None
     openrouter_app_name: str = "purple-avito-hackaton"
+    normalize_text: bool = True
+    noise_min_words: int = 3
+    noise_min_unique_ratio: float = 0.35
+    collapse_repeated_words: bool = True
+    sentence_head_count: int = 1
+    sentence_tail_count: int = 1
+    sentence_top_k: int = 7
+    split_target_mode: str = "split"
+    split_keyword_phrases: Tuple[str, ...] = (
+        "отдельно",
+        "по отдельности",
+        "раздельно",
+        "разделить",
+        "разделим",
+        "разделю",
+        "разбить",
+        "по частям",
+        "частями",
+        "при необходимости",
+        "при необходимости отдельно",
+        "отдельные виды",
+        "частичный ремонт",
+        "поэтапный ремонт",
+        "несколько вариантов",
+        "варианты",
+        "дополнительно",
+        "можно отдельно",
+        "отдельный",
+    )
+    long_text_mode: str = "head"
+    long_text_window_tokens: int = 256
+    long_text_stride_tokens: int = 192
+    long_text_max_windows: int = 4
+    top_k_drafts: int = 5
+    use_cross_encoder: bool = False
+    cross_encoder_alpha: float = 0.5
+    cross_encoder_loss_weight: float = 0.5
+    split_equals_detected_when_should_split: bool = False
 
 
 @dataclass
@@ -115,9 +182,17 @@ class TrainingSettings:
     lr: float = 3e-5
     weight_decay: float = 0.01
     split_loss_weight: float = 0.5
+    split_pos_weight: float = 3.0
     patience: int = 2
     min_delta: float = 1e-4
     threshold_grid: Tuple[float, ...] = (0.08, 0.12, 0.16, 0.20, 0.24)
+    split_threshold_grid: Tuple[float, ...] = (0.35, 0.40, 0.45, 0.50, 0.55, 0.60)
+    optimize_for: str = "f1"
+    min_recall: float = 0.0
+    cross_encoder_loss_weight: float = 0.5
+    balance_should_split_batches: bool = False
+    batch_false_ratio: float = 0.7
+    batch_true_ratio: float = 0.3
 
 
 def _parse_int_list(raw_value: Any) -> List[int]:
@@ -139,6 +214,58 @@ def _parse_int_list(raw_value: Any) -> List[int]:
 
     parts = [p.strip() for p in text.replace(";", ",").split(",")]
     return [int(p) for p in parts if p and p.isdigit()]
+
+
+def _normalize_text_content(text: str) -> str:
+    if not text:
+        return ""
+
+    cleaned = unicodedata.normalize("NFKC", str(text))
+    cleaned = re.sub(r"\\u[0-9a-fA-F]{4}|\\U[0-9a-fA-F]{8}", " ", cleaned)
+    cleaned = cleaned.replace("\u00A0", " ")
+    cleaned = re.sub(r"[\r\n\t]+", " ", cleaned)
+    cleaned = re.sub(r"[\U0001F300-\U0001FAFF\U00002700-\U000027BF\U000024C2-\U0001F251]", " ", cleaned)
+    cleaned = "".join(ch if unicodedata.category(ch) not in {"So", "Sk", "Cs", "Cf"} else " " for ch in cleaned)
+    cleaned = re.sub(r"[~]{3,}", " ", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned
+
+
+def _tokenize_words(text: str) -> List[str]:
+    return re.findall(r"[\w\-]+", text.lower(), flags=re.UNICODE)
+
+
+def _collapse_repeated_words(text: str, max_repeat: int = 2) -> str:
+    words = str(text).split()
+    if not words:
+        return ""
+
+    collapsed: List[str] = []
+    prev = ""
+    run = 0
+    for word in words:
+        norm = word.casefold()
+        if norm == prev:
+            run += 1
+        else:
+            prev = norm
+            run = 1
+        if run <= max_repeat:
+            collapsed.append(word)
+    return " ".join(collapsed)
+
+
+def _split_into_sentences(text: str) -> List[str]:
+    parts = re.split(r"(?<=[.!?])\s+|[\n\r;]+", str(text))
+    return [p.strip() for p in parts if p and p.strip()]
+
+
+def _sentence_noise_score(sentence: str, min_words: int, min_unique_ratio: float) -> bool:
+    words = _tokenize_words(sentence)
+    if len(words) < max(1, int(min_words)):
+        return True
+    unique_ratio = len(set(words)) / max(len(words), 1)
+    return unique_ratio < float(min_unique_ratio)
 
 
 def load_microcategories_from_csv(csv_path: str) -> List[MicroCategory]:
@@ -219,8 +346,6 @@ def split_dataset(items: Sequence[LabeledItem]) -> Dict[str, List[LabeledItem]]:
 
 
 class TfidfMicroCategoryRetriever:
-    """TF-IDF retriever over key phrases with bi/tri-grams and optional char n-grams for candidate filtering."""
-
     def __init__(
             self,
             ngram_range: Tuple[int, int] = (2, 3),
@@ -259,7 +384,6 @@ class TfidfMicroCategoryRetriever:
 
     @staticmethod
     def _mc_document(mc: MicroCategory) -> str:
-        # Duplicate key phrases in document to strengthen category-specific terms.
         phrases = [p.strip() for p in mc.key_phrases if p and p.strip()]
         return " ; ".join(phrases + phrases)
 
@@ -289,7 +413,6 @@ class TfidfMicroCategoryRetriever:
         query_vec = self.vectorizer.transform([text])
         sims = (query_vec @ self._mc_matrix.T).toarray().ravel()
 
-        # If char n-grams enabled, blend word and char similarities
         if self.use_char_ngrams and self._mc_matrix_char is not None:
             query_vec_char = self.char_vectorizer.transform([text])
             sims_char = (query_vec_char @ self._mc_matrix_char.T).toarray().ravel()
@@ -309,13 +432,6 @@ class TfidfMicroCategoryRetriever:
 
 
 class TransformerSoftmaxSplitModel(_BaseModule):
-    """
-    Softmax model:
-    - Transformer encodes ad text.
-    - Trainable embedding table encodes microcategories.
-    - Dot-product logits -> probability distribution over candidate microcategories.
-    """
-
     def __init__(
             self,
             model_name: str,
@@ -323,21 +439,45 @@ class TransformerSoftmaxSplitModel(_BaseModule):
             hidden_dim: Optional[int] = None,
             dropout: float = 0.1,
             max_length: int = 256,
+            long_text_mode: str = "head",
+            long_text_window_tokens: int = 256,
+            long_text_stride_tokens: int = 192,
+            long_text_max_windows: int = 4,
+            split_keyword_phrases: Optional[Sequence[str]] = None,
     ) -> None:
         _require_torch()
         _require_transformers()
         super().__init__()
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.text_encoder = AutoModel.from_pretrained(model_name)
+        self.tokenizer = _load_tokenizer(model_name)
+        self.text_encoder = _load_text_encoder(model_name)
         encoder_hidden = self.text_encoder.config.hidden_size
         self.hidden_dim = hidden_dim or encoder_hidden
         self.max_length = max_length
+        self.long_text_mode = str(long_text_mode).strip().lower() or "head"
+        if self.long_text_mode not in {"head", "head_tail", "chunks"}:
+            self.long_text_mode = "head"
+        self.long_text_window_tokens = max(32, int(long_text_window_tokens))
+        self.long_text_stride_tokens = max(8, int(long_text_stride_tokens))
+        self.long_text_max_windows = max(1, int(long_text_max_windows))
 
         self.projection = nn.Linear(encoder_hidden, self.hidden_dim)
         self.dropout = nn.Dropout(dropout)
         self.mc_embeddings = nn.Embedding(num_microcategories, self.hidden_dim)
+        self.split_feature_dim = 4
         self.split_head = nn.Linear(self.hidden_dim, 1)
+        self.split_keyword_head = nn.Sequential(
+            nn.Linear(self.split_feature_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_dim, 1),
+        )
+        self.cross_head = nn.Linear(self.hidden_dim, 1)
         self.temperature = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+        self._split_keyword_lexicon = tuple(
+            str(phrase).strip().lower()
+            for phrase in (split_keyword_phrases or ())
+            if str(phrase).strip()
+        )
 
     def _pool(self, last_hidden_state: Any, attention_mask: Any) -> Any:
         mask = attention_mask.unsqueeze(-1).float()
@@ -345,9 +485,157 @@ class TransformerSoftmaxSplitModel(_BaseModule):
         denom = mask.sum(dim=1).clamp_min(1e-6)
         return summed / denom
 
+    def _available_tokens_without_specials(self) -> int:
+        return max(8, int(self.max_length) - 2)
+
+    def _build_text_windows(self, token_ids: List[int]) -> List[List[int]]:
+        available = self._available_tokens_without_specials()
+        if not token_ids:
+            fallback = self.tokenizer.unk_token_id
+            if fallback is None:
+                fallback = self.tokenizer.pad_token_id
+            if fallback is None:
+                fallback = 0
+            token_ids = [int(fallback)]
+
+        mode = self.long_text_mode
+        if mode == "head":
+            return [token_ids[:available]]
+
+        if mode == "head_tail":
+            if len(token_ids) <= available:
+                return [token_ids]
+            head_len = available // 2
+            tail_len = available - head_len
+            return [token_ids[:head_len] + token_ids[-tail_len:]]
+
+        window_size = min(self.long_text_window_tokens, available)
+        stride = max(1, min(self.long_text_stride_tokens, window_size))
+        windows: List[List[int]] = []
+        for start in range(0, len(token_ids), stride):
+            chunk = token_ids[start:start + window_size]
+            if not chunk:
+                continue
+            windows.append(chunk)
+            if len(windows) >= self.long_text_max_windows:
+                break
+            if start + window_size >= len(token_ids):
+                break
+        if not windows:
+            windows = [token_ids[:window_size]]
+        return windows
+
+    def _encode_text_with_windows(self, text: str, device: Any) -> Any:
+        token_ids = self.tokenizer.encode(str(text), add_special_tokens=False)
+        windows = self._build_text_windows(token_ids)
+        input_ids: List[List[int]] = []
+        attention_masks: List[List[int]] = []
+        cls_token_id = self.tokenizer.cls_token_id
+        sep_token_id = self.tokenizer.sep_token_id
+        specials = int(cls_token_id is not None) + int(sep_token_id is not None)
+        max_chunk_len = max(1, int(self.max_length) - specials)
+        for chunk in windows:
+            chunk = list(chunk[:max_chunk_len])
+            seq: List[int] = []
+            if cls_token_id is not None:
+                seq.append(int(cls_token_id))
+            seq.extend(chunk)
+            if sep_token_id is not None:
+                seq.append(int(sep_token_id))
+            input_ids.append(seq)
+            attention_masks.append([1] * len(seq))
+
+        max_seq_len = max(len(seq) for seq in input_ids)
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = 0
+
+        padded_ids = [seq + [pad_token_id] * (max_seq_len - len(seq)) for seq in input_ids]
+        padded_masks = [mask + [0] * (max_seq_len - len(mask)) for mask in attention_masks]
+        batch = {
+            "input_ids": torch.tensor(padded_ids, dtype=torch.long, device=device),
+            "attention_mask": torch.tensor(padded_masks, dtype=torch.long, device=device),
+        }
+
+        outputs = self.text_encoder(**batch)
+        pooled = self._pool(outputs.last_hidden_state, batch["attention_mask"])
+        projected = self.dropout(self.projection(pooled))
+
+        if projected.size(0) == 1:
+            return projected[0]
+        return projected.max(dim=0).values
+
     def encode_text(self, texts: Sequence[str], device: Any) -> Any:
+        if self.long_text_mode == "head":
+            batch = self.tokenizer(
+                list(texts),
+                padding=True,
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors="pt",
+            )
+            batch = {k: v.to(device) for k, v in batch.items()}
+            outputs = self.text_encoder(**batch)
+            pooled = self._pool(outputs.last_hidden_state, batch["attention_mask"])
+            return self.dropout(self.projection(pooled))
+
+        embeddings = [self._encode_text_with_windows(text, device) for text in texts]
+        return torch.stack(embeddings, dim=0)
+
+    def forward(self, text_embeddings: Any, mc_indices: Any) -> Any:
+        mc_vecs = self.mc_embeddings(mc_indices)
+        logits = torch.matmul(text_embeddings, mc_vecs.transpose(0, 1))
+        temp = torch.clamp(self.temperature, min=0.05)
+        return logits / temp
+
+    def _split_keyword_features(self, text: str, device: Any) -> Any:
+        lower_text = str(text).lower()
+        words = _tokenize_words(lower_text)
+        sentences = _split_into_sentences(lower_text)
+
+        hit_phrases = [phrase for phrase in self._split_keyword_lexicon if phrase in lower_text]
+        total_hits = sum(lower_text.count(phrase) for phrase in hit_phrases)
+        sentence_hits = sum(
+            1 for sentence in sentences if any(phrase in sentence for phrase in self._split_keyword_lexicon)
+        )
+
+        features = [
+            1.0 if hit_phrases else 0.0,
+            len(hit_phrases) / max(len(self._split_keyword_lexicon), 1),
+            total_hits / max(len(words), 1),
+            sentence_hits / max(len(sentences), 1) if sentences else 0.0,
+        ]
+        return torch.tensor(features, dtype=torch.float32, device=device)
+
+    def _split_keyword_feature_batch(self, texts: Sequence[str], device: Any) -> Any:
+        return torch.stack([self._split_keyword_features(text, device) for text in texts], dim=0)
+
+    def split_logits(self, text_embeddings: Any, texts: Optional[Sequence[str]] = None) -> Any:
+        if text_embeddings.dim() == 1:
+            text_embeddings = text_embeddings.unsqueeze(0)
+
+        if texts is None:
+            keyword_features = torch.zeros(
+                (text_embeddings.size(0), self.split_feature_dim),
+                dtype=text_embeddings.dtype,
+                device=text_embeddings.device,
+            )
+        else:
+            keyword_features = self._split_keyword_feature_batch(texts, text_embeddings.device)
+            if keyword_features.dim() == 1:
+                keyword_features = keyword_features.unsqueeze(0)
+
+        return (
+            self.split_head(text_embeddings).squeeze(-1)
+            + self.split_keyword_head(keyword_features).squeeze(-1)
+        )
+
+    def cross_logits(self, texts: Sequence[str], candidate_texts: Sequence[str], device: Any) -> Any:
+        if len(texts) != len(candidate_texts):
+            raise ValueError("texts and candidate_texts must have equal lengths")
         batch = self.tokenizer(
             list(texts),
+            list(candidate_texts),
             padding=True,
             truncation=True,
             max_length=self.max_length,
@@ -356,21 +644,11 @@ class TransformerSoftmaxSplitModel(_BaseModule):
         batch = {k: v.to(device) for k, v in batch.items()}
         outputs = self.text_encoder(**batch)
         pooled = self._pool(outputs.last_hidden_state, batch["attention_mask"])
-        return self.dropout(self.projection(pooled))
-
-    def forward(self, text_embeddings: Any, mc_indices: Any) -> Any:
-        mc_vecs = self.mc_embeddings(mc_indices)
-        logits = torch.matmul(text_embeddings, mc_vecs.transpose(0, 1))
-        temp = torch.clamp(self.temperature, min=0.05)
-        return logits / temp
-
-    def split_logits(self, text_embeddings: Any) -> Any:
-        return self.split_head(text_embeddings).squeeze(-1)
+        pair_embeddings = self.dropout(self.projection(pooled))
+        return self.cross_head(pair_embeddings).squeeze(-1)
 
 
 class DraftSplitPipeline:
-    """End-to-end pipeline for category detection and draft split prediction."""
-
     def __init__(
             self,
             microcategories: Sequence[MicroCategory],
@@ -385,15 +663,32 @@ class DraftSplitPipeline:
             relative_ratio: float = 0.0,
             score_blend_alpha: float = 1.0,
             max_length: int = 256,
+            long_text_mode: str = "head",
+            long_text_window_tokens: int = 256,
+            long_text_stride_tokens: int = 192,
+            long_text_max_windows: int = 4,
+            top_k_drafts: int = 5,
+            use_cross_encoder: bool = False,
+            cross_encoder_alpha: float = 0.5,
+            cross_encoder_loss_weight: float = 0.5,
             device: Optional[str] = None,
             use_char_ngrams: bool = True,
-                use_llm_drafts: bool = False,
-                openrouter_model: str = "qwen/qwen3.6-plus:free",
-                openrouter_api_key: Optional[str] = None,
-                openrouter_base_url: str = "https://openrouter.ai/api/v1/chat/completions",
-                openrouter_timeout_sec: float = 30.0,
-                openrouter_site_url: Optional[str] = None,
-                openrouter_app_name: str = "purple-avito-hackaton",
+            use_llm_drafts: bool = False,
+            openrouter_model: str = "qwen/qwen3.6-plus:free",
+            openrouter_api_key: Optional[str] = None,
+            openrouter_base_url: str = "https://openrouter.ai/api/v1/chat/completions",
+            openrouter_timeout_sec: float = 30.0,
+            openrouter_site_url: Optional[str] = None,
+            openrouter_app_name: str = "purple-avito-hackaton",
+            normalize_text: bool = True,
+                noise_min_words: int = 3,
+                noise_min_unique_ratio: float = 0.35,
+                collapse_repeated_words: bool = True,
+                sentence_head_count: int = 1,
+                sentence_tail_count: int = 1,
+                sentence_top_k: int = 7,
+                split_keyword_phrases: Optional[Sequence[str]] = None,
+                split_equals_detected_when_should_split: bool = False,
             settings: Optional[PipelineSettings] = None,
     ) -> None:
         _require_torch()
@@ -413,6 +708,14 @@ class DraftSplitPipeline:
             relative_ratio = settings.relative_ratio
             score_blend_alpha = settings.score_blend_alpha
             max_length = settings.max_length
+            long_text_mode = settings.long_text_mode
+            long_text_window_tokens = settings.long_text_window_tokens
+            long_text_stride_tokens = settings.long_text_stride_tokens
+            long_text_max_windows = settings.long_text_max_windows
+            top_k_drafts = settings.top_k_drafts
+            use_cross_encoder = settings.use_cross_encoder
+            cross_encoder_alpha = settings.cross_encoder_alpha
+            cross_encoder_loss_weight = settings.cross_encoder_loss_weight
             device = settings.device if settings.device is not None else device
             use_llm_drafts = settings.use_llm_drafts
             openrouter_model = settings.openrouter_model
@@ -421,6 +724,16 @@ class DraftSplitPipeline:
             openrouter_timeout_sec = settings.openrouter_timeout_sec
             openrouter_site_url = settings.openrouter_site_url
             openrouter_app_name = settings.openrouter_app_name
+            normalize_text = settings.normalize_text
+            noise_min_words = settings.noise_min_words
+            noise_min_unique_ratio = settings.noise_min_unique_ratio
+            collapse_repeated_words = settings.collapse_repeated_words
+            sentence_head_count = settings.sentence_head_count
+            sentence_tail_count = settings.sentence_tail_count
+            sentence_top_k = settings.sentence_top_k
+            split_target_mode = settings.split_target_mode
+            split_keyword_phrases = settings.split_keyword_phrases
+            split_equals_detected_when_should_split = settings.split_equals_detected_when_should_split
 
         self.id_to_title = {mc.mc_id: mc.mc_title for mc in self.microcategories}
         self.id_to_idx = {mc.mc_id: i for i, mc in enumerate(self.microcategories)}
@@ -440,6 +753,11 @@ class DraftSplitPipeline:
             model_name=transformer_name,
             num_microcategories=len(self.microcategories),
             max_length=max_length,
+            long_text_mode=long_text_mode,
+            long_text_window_tokens=long_text_window_tokens,
+            long_text_stride_tokens=long_text_stride_tokens,
+            long_text_max_windows=long_text_max_windows,
+            split_keyword_phrases=split_keyword_phrases,
         ).to(self.device)
         self.prob_threshold = prob_threshold
         self.split_threshold = split_threshold
@@ -455,9 +773,139 @@ class DraftSplitPipeline:
         self.openrouter_site_url = openrouter_site_url
         self.openrouter_app_name = str(openrouter_app_name)
         self.openrouter_api_key = openrouter_api_key or os.getenv("OPENROUTER_API_KEY")
+        self.normalize_text = bool(normalize_text)
+        self.noise_min_words = max(1, int(noise_min_words))
+        self.noise_min_unique_ratio = min(1.0, max(0.0, float(noise_min_unique_ratio)))
+        self.collapse_repeated_words = bool(collapse_repeated_words)
+        self.sentence_head_count = max(0, int(sentence_head_count))
+        self.sentence_tail_count = max(0, int(sentence_tail_count))
+        self.sentence_top_k = max(0, int(sentence_top_k))
+        self.split_target_mode = str(split_target_mode).strip().lower()
+        if self.split_target_mode not in {"split", "detected"}:
+            raise ValueError("split_target_mode must be either 'split' or 'detected'")
+        self.split_keyword_phrases = tuple(
+            str(phrase).strip().lower()
+            for phrase in (split_keyword_phrases or ())
+            if str(phrase).strip()
+        )
+        self.split_equals_detected_when_should_split = bool(split_equals_detected_when_should_split)
+        self.top_k_drafts = max(0, int(top_k_drafts))
+        self.use_cross_encoder = bool(use_cross_encoder)
+        self.cross_encoder_alpha = min(1.0, max(0.0, float(cross_encoder_alpha)))
+        self.cross_encoder_loss_weight = max(0.0, float(cross_encoder_loss_weight))
+        self.id_to_candidate_text = {
+            mc.mc_id: self.retriever._mc_document(mc) for mc in self.microcategories
+        }
+        self._phrase_lexicon = {
+            p.strip().lower()
+            for mc in self.microcategories
+            for p in mc.key_phrases
+            if p and p.strip()
+        }
+        self._split_keyword_lexicon = set(self.split_keyword_phrases)
         self.llm_success_count = 0
         self.llm_fallback_count = 0
         self.last_llm_error: Optional[str] = None
+
+    def _get_split_target_mc_ids(self, item: LabeledItem) -> List[int]:
+        if self.split_target_mode == "detected":
+            return list(item.target_detected_mc_ids)
+        return list(item.target_split_mc_ids)
+
+    def _split_keyword_features(self, text: str) -> Any:
+        lower_text = str(text).lower()
+        words = _tokenize_words(lower_text)
+        sentences = _split_into_sentences(lower_text)
+
+        hit_phrases = [phrase for phrase in self._split_keyword_lexicon if phrase in lower_text]
+        total_hits = sum(lower_text.count(phrase) for phrase in hit_phrases)
+        sentence_hits = sum(
+            1 for sentence in sentences if any(phrase in sentence for phrase in self._split_keyword_lexicon)
+        )
+
+        features = [
+            1.0 if hit_phrases else 0.0,
+            len(hit_phrases) / max(len(self._split_keyword_lexicon), 1),
+            total_hits / max(len(words), 1),
+            sentence_hits / max(len(sentences), 1) if sentences else 0.0,
+        ]
+        return torch.tensor(features, dtype=torch.float32, device=self.device)
+
+    def _split_keyword_feature_batch(self, texts: Sequence[str]) -> Any:
+        return torch.stack([self._split_keyword_features(text) for text in texts], dim=0)
+
+    def _sentence_signal_score(self, sentence: str) -> float:
+        words = _tokenize_words(sentence)
+        if not words:
+            return 0.0
+        lower_sentence = sentence.lower()
+        phrase_hits = sum(1 for phrase in self._phrase_lexicon if len(phrase) >= 4 and phrase in lower_sentence)
+        uniq = len(set(words))
+        return float(phrase_hits * 3 + uniq)
+
+    def _select_informative_sentences(self, text: str) -> str:
+        sentences = _split_into_sentences(text)
+        if not sentences:
+            return text
+
+        filtered: List[str] = []
+        seen: set[str] = set()
+        for sentence in sentences:
+            compact = " ".join(sentence.split())
+            if self.collapse_repeated_words:
+                compact = _collapse_repeated_words(compact)
+            if not compact:
+                continue
+            if _sentence_noise_score(compact, self.noise_min_words, self.noise_min_unique_ratio):
+                continue
+            dedup_key = compact.casefold()
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+            filtered.append(compact)
+
+        if not filtered:
+            fallback = " ".join(str(text).split())
+            return _collapse_repeated_words(fallback) if self.collapse_repeated_words else fallback
+
+        selected: List[str] = []
+        used_indices: set[int] = set()
+
+        for idx in range(min(self.sentence_head_count, len(filtered))):
+            selected.append(filtered[idx])
+            used_indices.add(idx)
+
+        if self.sentence_tail_count > 0:
+            tail_start = max(0, len(filtered) - self.sentence_tail_count)
+            for idx in range(tail_start, len(filtered)):
+                if idx in used_indices:
+                    continue
+                selected.append(filtered[idx])
+                used_indices.add(idx)
+
+        if self.sentence_top_k > 0:
+            scored = [
+                (idx, self._sentence_signal_score(sentence))
+                for idx, sentence in enumerate(filtered)
+                if idx not in used_indices
+            ]
+            scored.sort(key=lambda x: x[1], reverse=True)
+            for idx, _ in scored[: self.sentence_top_k]:
+                selected.append(filtered[idx])
+                used_indices.add(idx)
+
+        if not selected:
+            selected = filtered
+        return " ".join(selected)
+
+    def _prepare_text(self, text: str) -> str:
+        prepared = " ".join(str(text).strip().split())
+        if self.normalize_text:
+            prepared = _normalize_text_content(prepared)
+        if self.collapse_repeated_words:
+            prepared = _collapse_repeated_words(prepared)
+        prepared = self._select_informative_sentences(prepared)
+        return " ".join(prepared.split())
 
     def train_step(
             self,
@@ -468,6 +916,8 @@ class DraftSplitPipeline:
             source_mc_ids: Sequence[int],
             optimizer: Any,
             split_loss_weight: float = 0.5,
+            split_pos_weight: float = 5.0,
+                cross_encoder_loss_weight: float = 0.5,
     ) -> float:
         if (
                 len(texts) != len(candidate_mc_ids)
@@ -497,6 +947,13 @@ class DraftSplitPipeline:
                 target_vec.fill_(1.0 / len(candidates))
             return target_vec
 
+        def build_pair_targets(candidates: Sequence[int], targets: Sequence[int], source_mc_id: int) -> Any:
+            target_vec = torch.zeros(len(candidates), dtype=torch.float32, device=self.device)
+            positive_ids = [mc_id for mc_id in targets if mc_id in candidates and mc_id != source_mc_id]
+            for mc_id in positive_ids:
+                target_vec[candidates.index(mc_id)] = 1.0
+            return target_vec
+
         for text, candidates, target_mc_list, should_split_target, source_mc_id in zip(
                 texts,
                 candidate_mc_ids,
@@ -507,13 +964,14 @@ class DraftSplitPipeline:
             if not candidates:
                 continue
             candidates_unique = list(dict.fromkeys(candidates))
+            prepared_text = self._prepare_text(text)
 
             cand_indices = torch.tensor(
                 [self.id_to_idx[mc_id] for mc_id in candidates_unique],
                 dtype=torch.long,
                 device=self.device,
             )
-            text_emb = self.model.encode_text([text], self.device)
+            text_emb = self.model.encode_text([prepared_text], self.device)
             logits = self.model(text_emb, cand_indices).squeeze(0)
             target_distribution = build_target_distribution(candidates_unique, target_mc_list, source_mc_id)
             loss = nn.functional.kl_div(
@@ -521,10 +979,26 @@ class DraftSplitPipeline:
                 target_distribution,
                 reduction="batchmean",
             )
-            split_logit = self.model.split_logits(text_emb).view(-1)
+            split_logit = self.model.split_logits(text_emb, [prepared_text]).view(-1)
             split_target = torch.tensor([1.0 if should_split_target else 0.0], device=self.device)
-            split_loss = nn.functional.binary_cross_entropy_with_logits(split_logit, split_target)
+            pos_weight = torch.tensor([max(1e-6, float(split_pos_weight))], device=self.device)
+            split_loss = nn.functional.binary_cross_entropy_with_logits(
+                split_logit,
+                split_target,
+                pos_weight=pos_weight,
+            )
             total_loss = total_loss + loss + split_loss_weight * split_loss
+
+            if self.use_cross_encoder:
+                candidate_texts = [self.id_to_candidate_text[mc_id] for mc_id in candidates_unique]
+                pair_logits = self.model.cross_logits(
+                    [prepared_text] * len(candidates_unique),
+                    candidate_texts,
+                    self.device,
+                )
+                pair_targets = build_pair_targets(candidates_unique, target_mc_list, source_mc_id)
+                cross_loss = nn.functional.binary_cross_entropy_with_logits(pair_logits, pair_targets)
+                total_loss = total_loss + cross_encoder_loss_weight * cross_loss
             used_examples += 1
 
         if used_examples == 0:
@@ -536,7 +1010,6 @@ class DraftSplitPipeline:
         return float(total_loss.detach().cpu().item())
 
     def build_candidates(self, item: Item, force_include: Optional[Sequence[int]] = None) -> List[int]:
-        # In the current problem we only have 11 microcategories, so filtering is not necessary.
         candidates = [mc.mc_id for mc in self.microcategories]
         if force_include:
             for mc_id in force_include:
@@ -552,24 +1025,58 @@ class DraftSplitPipeline:
             epochs: int = 1,
             force_include_targets: bool = False,
             split_loss_weight: float = 0.5,
+            split_pos_weight: float = 5.0,
+            cross_encoder_loss_weight: float = 0.5,
+                balance_should_split_batches: bool = False,
+                batch_false_ratio: float = 0.7,
+                batch_true_ratio: float = 0.3,
+            log_epoch: Optional[int] = None,
+            log_total_epochs: Optional[int] = None,
             verbose: bool = False,
     ) -> List[float]:
         history: List[float] = []
         if batch_size <= 0:
             raise ValueError("batch_size must be > 0")
 
+        def _build_epoch_items() -> List[LabeledItem]:
+            if not balance_should_split_batches:
+                return list(items)
+
+            negatives = [x for x in items if not bool(x.should_split)]
+            positives = [x for x in items if bool(x.should_split)]
+            if not negatives or not positives:
+                return list(items)
+
+            total = len(items)
+            ratio_sum = max(1e-6, float(batch_false_ratio) + float(batch_true_ratio))
+            neg_target = int(round(total * float(batch_false_ratio) / ratio_sum))
+            neg_target = max(0, min(neg_target, len(negatives)))
+            pos_target = max(0, total - neg_target)
+
+            epoch_items = random.sample(negatives, k=neg_target)
+            epoch_items.extend(random.choices(positives, k=pos_target))
+            random.shuffle(epoch_items)
+            return epoch_items
+
+        total_steps = (len(items) + batch_size - 1) // batch_size if items else 0
         for _ in range(epochs):
+            epoch_items = _build_epoch_items()
             epoch_index = len(history) + 1
+            display_epoch = log_epoch if log_epoch is not None else epoch_index
+            display_total_epochs = log_total_epochs if log_total_epochs is not None else epochs
             epoch_loss = 0.0
             steps = 0
-            for i in range(0, len(items), batch_size):
-                batch = items[i: i + batch_size]
+            for i in range(0, len(epoch_items), batch_size):
+                batch = epoch_items[i: i + batch_size]
                 texts = [x.description for x in batch]
                 candidates = [
-                    self.build_candidates(x, force_include=x.target_split_mc_ids if force_include_targets else None)
+                    self.build_candidates(
+                        x,
+                        force_include=self._get_split_target_mc_ids(x) if force_include_targets else None,
+                    )
                     for x in batch
                 ]
-                target_mc_ids = [x.target_split_mc_ids for x in batch]
+                target_mc_ids = [self._get_split_target_mc_ids(x) for x in batch]
                 should_split_targets = [x.should_split for x in batch]
                 source_mc_ids = [x.mc_id for x in batch]
                 loss = self.train_step(
@@ -580,13 +1087,27 @@ class DraftSplitPipeline:
                     source_mc_ids,
                     optimizer,
                     split_loss_weight=split_loss_weight,
+                    split_pos_weight=split_pos_weight,
+                    cross_encoder_loss_weight=cross_encoder_loss_weight,
                 )
                 epoch_loss += loss
                 steps += 1
+                if verbose and total_steps > 0:
+                    avg_loss = epoch_loss / max(steps, 1)
+                    progress = (steps / total_steps) * 100.0
+                    print(
+                        f"Epoch {display_epoch}/{display_total_epochs} | "
+                        f"step {steps}/{total_steps} ({progress:5.1f}%) | "
+                        f"avg_loss={avg_loss:.4f}",
+                        end="\r",
+                        flush=True,
+                    )
             epoch_avg_loss = epoch_loss / max(steps, 1)
             history.append(epoch_avg_loss)
             if verbose:
-                print(f"Epoch {epoch_index}/{epochs} | train_loss={epoch_avg_loss:.4f}")
+                if total_steps > 0:
+                    print()
+                print(f"Epoch {display_epoch}/{display_total_epochs} | train_loss={epoch_avg_loss:.4f}")
         return history
 
     def fit_with_early_stopping(
@@ -601,7 +1122,8 @@ class DraftSplitPipeline:
         best_state = None
         best_metrics: Optional[Dict[str, float]] = None
         best_threshold = self.prob_threshold
-        best_f1 = -1.0
+        best_split_threshold = self.split_threshold
+        best_score = -1.0
         patience_left = settings.patience
         history: List[Dict[str, Any]] = []
 
@@ -612,22 +1134,53 @@ class DraftSplitPipeline:
                 batch_size=settings.batch_size,
                 epochs=1,
                 split_loss_weight=settings.split_loss_weight,
-                verbose=False,
+                split_pos_weight=settings.split_pos_weight,
+                cross_encoder_loss_weight=settings.cross_encoder_loss_weight,
+                balance_should_split_batches=settings.balance_should_split_batches,
+                batch_false_ratio=settings.batch_false_ratio,
+                batch_true_ratio=settings.batch_true_ratio,
+                log_epoch=epoch,
+                log_total_epochs=settings.epochs,
+                verbose=verbose,
             )
             loss_value = loss_history[-1] if loss_history else 0.0
-            threshold_report = search_best_probability_threshold(self, val_items, settings.threshold_grid)
-            val_metrics = threshold_report["metrics"]
-            current_f1 = val_metrics["f1_micro"]
+            if verbose:
+                print(f"Epoch {epoch}/{settings.epochs} | tuning prob_threshold on val...")
+            threshold_report = search_best_probability_threshold(
+                self,
+                val_items,
+                settings.threshold_grid,
+                optimize_for=settings.optimize_for,
+                min_recall=settings.min_recall,
+            )
+            self.prob_threshold = threshold_report["threshold"]
+            if verbose:
+                print(f"Epoch {epoch}/{settings.epochs} | tuning split_threshold on val...")
+            split_threshold_report = evaluate_split_probability_threshold(
+                self,
+                val_items,
+                settings.split_threshold_grid,
+                optimize_for=settings.optimize_for,
+                min_recall=settings.min_recall,
+            )
+            self.split_threshold = split_threshold_report["threshold"]
+            val_metrics = evaluate_split_quality(self, val_items)
+            current_score = _selection_score(
+                val_metrics,
+                optimize_for=settings.optimize_for,
+                min_recall=settings.min_recall,
+            )
 
             if verbose:
                 print(
                     f"Epoch {epoch}/{settings.epochs} | "
                     f"train_loss={loss_value:.4f} | "
-                    f"val_f1={current_f1:.4f} | "
+                    f"val_f1={val_metrics['f1_micro']:.4f} | "
                     f"val_precision={val_metrics['precision_micro']:.4f} | "
                     f"val_recall={val_metrics['recall_micro']:.4f} | "
                     f"shouldSplit_acc={val_metrics['should_split_accuracy']:.4f} | "
-                    f"threshold={threshold_report['threshold']:.2f}"
+                    f"threshold={threshold_report['threshold']:.2f} | "
+                    f"split_threshold={split_threshold_report['threshold']:.2f}"
                 )
 
             history.append(
@@ -635,13 +1188,15 @@ class DraftSplitPipeline:
                     "epoch": epoch,
                     "loss": loss_value,
                     "threshold": threshold_report["threshold"],
+                    "split_threshold": split_threshold_report["threshold"],
                     "metrics": val_metrics,
                 }
             )
 
-            if current_f1 > best_f1 + settings.min_delta:
-                best_f1 = current_f1
+            if current_score > best_score + settings.min_delta:
+                best_score = current_score
                 best_threshold = threshold_report["threshold"]
+                best_split_threshold = split_threshold_report["threshold"]
                 best_metrics = val_metrics
                 best_state = copy.deepcopy(self.model.state_dict())
                 patience_left = settings.patience
@@ -653,18 +1208,23 @@ class DraftSplitPipeline:
         if best_state is not None:
             self.model.load_state_dict(best_state)
         self.prob_threshold = best_threshold
+        self.split_threshold = best_split_threshold
 
         return {
             "history": history,
             "best_threshold": best_threshold,
+            "best_split_threshold": best_split_threshold,
             "best_metrics": best_metrics,
-            "best_f1": best_f1,
+            "best_score": best_score,
+            "optimize_for": settings.optimize_for,
+            "min_recall": float(settings.min_recall),
         }
 
     def score_candidates(self, description: str, candidate_mc_ids: Sequence[int]) -> Dict[int, float]:
         if not candidate_mc_ids:
             return {}
 
+        prepared_description = self._prepare_text(description)
         self.model.eval()
         with torch.no_grad():
             cand_indices = torch.tensor(
@@ -672,7 +1232,7 @@ class DraftSplitPipeline:
                 dtype=torch.long,
                 device=self.device,
             )
-            text_emb = self.model.encode_text([description], self.device)
+            text_emb = self.model.encode_text([prepared_description], self.device)
             logits = self.model(text_emb, cand_indices).squeeze(0)
             probs = torch.softmax(logits, dim=-1).detach().cpu().numpy()
             return {mc_id: float(prob) for mc_id, prob in zip(candidate_mc_ids, probs)}
@@ -721,6 +1281,9 @@ class DraftSplitPipeline:
     def _apply_reranking_controls(self, scored_items: List[Tuple[int, float]]) -> List[int]:
         if not scored_items:
             return []
+
+        if self.top_k_drafts > 0:
+            scored_items = scored_items[: self.top_k_drafts]
 
         top_score = float(scored_items[0][1])
         selected: List[int] = []
@@ -846,14 +1409,15 @@ class DraftSplitPipeline:
         }
 
     def predict(self, item: Item) -> PredictionResult:
-        detected, tfidf_scores = self.retriever.detect(item.description)
+        prepared_description = self._prepare_text(item.description)
+        detected, tfidf_scores = self.retriever.detect(prepared_description)
         detected_wo_source = [mc_id for mc_id in detected if mc_id != item.mc_id]
-        prob_map = self.score_candidates(item.description, detected_wo_source)
+        prob_map = self.score_candidates(prepared_description, detected_wo_source)
         blended_scores = self._blend_scores(prob_map, tfidf_scores, detected_wo_source)
         self.model.eval()
         with torch.no_grad():
-            text_emb = self.model.encode_text([item.description], self.device)
-            split_prob = torch.sigmoid(self.model.split_logits(text_emb).view(-1)).item()
+            text_emb = self.model.encode_text([prepared_description], self.device)
+            split_prob = torch.sigmoid(self.model.split_logits(text_emb, [prepared_description]).view(-1)).item()
 
         selected = [
             (mc_id, score)
@@ -865,12 +1429,32 @@ class DraftSplitPipeline:
         should_split = split_prob >= self.split_threshold
         if not should_split:
             target_mc_ids = []
+        elif self.split_equals_detected_when_should_split:
+            target_mc_ids = list(dict.fromkeys(detected_wo_source))
+
+        if self.use_cross_encoder and target_mc_ids and not self.split_equals_detected_when_should_split:
+            candidate_texts = [self.id_to_candidate_text[mc_id] for mc_id in target_mc_ids]
+            cross_logits = self.model.cross_logits(
+                [prepared_description] * len(target_mc_ids),
+                candidate_texts,
+                self.device,
+            )
+            cross_probs = torch.sigmoid(cross_logits).detach().cpu().tolist()
+            cross_map = {mc_id: float(prob) for mc_id, prob in zip(target_mc_ids, cross_probs)}
+            reranked_scores: Dict[int, float] = {}
+            for mc_id in target_mc_ids:
+                base_score = float(blended_scores.get(mc_id, 0.0))
+                cross_score = float(cross_map.get(mc_id, 0.0))
+                reranked_scores[mc_id] = (
+                    (1.0 - self.cross_encoder_alpha) * base_score + self.cross_encoder_alpha * cross_score
+                )
+            target_mc_ids = [mc_id for mc_id, _ in sorted(reranked_scores.items(), key=lambda x: x[1], reverse=True)]
 
         drafts = [
             Draft(
                 mc_id=mc_id,
                 mc_title=self.id_to_title[mc_id],
-                text=self._generate_draft_text(self.id_to_title[mc_id], item.description),
+                text=self._generate_draft_text(self.id_to_title[mc_id], prepared_description),
             )
             for mc_id in target_mc_ids
         ]
@@ -886,7 +1470,6 @@ class DraftSplitPipeline:
 
 
 def to_response_json(result: PredictionResult) -> Dict[str, object]:
-    """Convert internal output to the hackathon response schema."""
     return {
         "detectedMcIds": result.detected_mc_ids,
         "shouldSplit": result.should_split,
@@ -905,7 +1488,6 @@ def evaluate_split_quality(
         pipeline: DraftSplitPipeline,
         items: Sequence[LabeledItem],
 ) -> Dict[str, float]:
-    """Compute micro Precision/Recall/F1 for targetSplitMcIds and shouldSplit accuracy."""
     tp = 0
     fp = 0
     fn = 0
@@ -914,7 +1496,7 @@ def evaluate_split_quality(
     for item in items:
         pred = pipeline.predict(item)
         pred_set = {d.mc_id for d in pred.drafts}
-        gold_set = set(item.target_split_mc_ids)
+        gold_set = set(pipeline._get_split_target_mc_ids(item))
 
         tp += len(pred_set & gold_set)
         fp += len(pred_set - gold_set)
@@ -925,12 +1507,42 @@ def evaluate_split_quality(
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
     accuracy = correct_split / len(items) if items else 0.0
+    composite = (precision + recall + accuracy) / 3.0
 
     return {
         "precision_micro": precision,
         "recall_micro": recall,
         "f1_micro": f1,
         "should_split_accuracy": accuracy,
+        "composite_score": composite,
+    }
+
+
+def evaluate_detect_quality(
+        pipeline: DraftSplitPipeline,
+        items: Sequence[LabeledItem],
+) -> Dict[str, float]:
+    tp = 0
+    fp = 0
+    fn = 0
+
+    for item in items:
+        pred = pipeline.predict(item)
+        pred_set = {mc_id for mc_id in pred.detected_mc_ids if mc_id != item.mc_id}
+        gold_set = set(item.target_detected_mc_ids)
+
+        tp += len(pred_set & gold_set)
+        fp += len(pred_set - gold_set)
+        fn += len(gold_set - pred_set)
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+
+    return {
+        "precision_micro": precision,
+        "recall_micro": recall,
+        "f1_micro": f1,
     }
 
 
@@ -939,6 +1551,8 @@ def _selection_score(metrics: Dict[str, float], optimize_for: str, min_recall: f
     precision = float(metrics.get("precision_micro", 0.0))
     recall = float(metrics.get("recall_micro", 0.0))
     f1 = float(metrics.get("f1_micro", 0.0))
+    should_split_accuracy = float(metrics.get("should_split_accuracy", 0.0))
+    composite = float(metrics.get("composite_score", (precision + recall + should_split_accuracy) / 3.0))
 
     if recall < float(min_recall):
         return -1.0
@@ -947,6 +1561,8 @@ def _selection_score(metrics: Dict[str, float], optimize_for: str, min_recall: f
         return precision
     if opt == "recall":
         return recall
+    if opt in {"composite", "joint"}:
+        return composite
     return f1
 
 
@@ -991,6 +1607,8 @@ def evaluate_split_probability_threshold(
         pipeline: DraftSplitPipeline,
         items: Sequence[LabeledItem],
         thresholds: Sequence[float],
+    optimize_for: str = "f1",
+    min_recall: float = 0.0,
 ) -> Dict[str, Any]:
     if not thresholds:
         raise ValueError("thresholds must not be empty")
@@ -1004,15 +1622,19 @@ def evaluate_split_probability_threshold(
     for threshold in thresholds:
         pipeline.split_threshold = float(threshold)
         metrics = evaluate_split_quality(pipeline, items)
-        results.append({"threshold": float(threshold), "metrics": metrics})
-        if metrics["should_split_accuracy"] > best_score:
-            best_score = metrics["should_split_accuracy"]
+        score = _selection_score(metrics, optimize_for=optimize_for, min_recall=min_recall)
+        results.append({"threshold": float(threshold), "metrics": metrics, "score": score})
+        if score > best_score:
+            best_score = score
             best_threshold = float(threshold)
             best_metrics = metrics
 
     pipeline.split_threshold = original_threshold
     return {
         "threshold": best_threshold,
+        "optimize_for": optimize_for,
+        "min_recall": float(min_recall),
+        "best_score": best_score,
         "metrics": best_metrics or evaluate_split_quality(pipeline, items),
         "results": results,
     }
@@ -1091,6 +1713,7 @@ def search_best_class_probability_thresholds(
 def search_best_reranking_controls(
         pipeline: DraftSplitPipeline,
         items: Sequence[LabeledItem],
+        top_k_grid: Sequence[int],
         max_drafts_grid: Sequence[int],
         margin_grid: Sequence[float],
         relative_ratio_grid: Sequence[float],
@@ -1098,6 +1721,8 @@ def search_best_reranking_controls(
         optimize_for: str = "f1",
         min_recall: float = 0.0,
 ) -> Dict[str, Any]:
+    if not top_k_grid:
+        raise ValueError("top_k_grid must not be empty")
     if not max_drafts_grid:
         raise ValueError("max_drafts_grid must not be empty")
     if not margin_grid:
@@ -1107,6 +1732,7 @@ def search_best_reranking_controls(
     if not blend_alpha_grid:
         raise ValueError("blend_alpha_grid must not be empty")
 
+    orig_top_k = pipeline.top_k_drafts
     orig_max_drafts = pipeline.max_drafts
     orig_margin = pipeline.score_margin
     orig_relative_ratio = pipeline.relative_ratio
@@ -1115,6 +1741,7 @@ def search_best_reranking_controls(
     best_metrics: Optional[Dict[str, float]] = None
     best_score = -1.0
     best_cfg = {
+        "top_k_drafts": orig_top_k,
         "max_drafts": orig_max_drafts,
         "score_margin": orig_margin,
         "relative_ratio": orig_relative_ratio,
@@ -1122,12 +1749,14 @@ def search_best_reranking_controls(
     }
     results: List[Dict[str, Any]] = []
 
-    for max_drafts, margin, ratio, blend_alpha in itertools.product(
+    for top_k, max_drafts, margin, ratio, blend_alpha in itertools.product(
+            top_k_grid,
             max_drafts_grid,
             margin_grid,
             relative_ratio_grid,
             blend_alpha_grid,
     ):
+        pipeline.top_k_drafts = max(0, int(top_k))
         pipeline.set_reranking_controls(
             max_drafts=int(max_drafts),
             score_margin=float(margin),
@@ -1138,6 +1767,7 @@ def search_best_reranking_controls(
         score = _selection_score(metrics, optimize_for=optimize_for, min_recall=min_recall)
         results.append(
             {
+                "top_k_drafts": int(top_k),
                 "max_drafts": int(max_drafts),
                 "score_margin": float(margin),
                 "relative_ratio": float(ratio),
@@ -1150,12 +1780,14 @@ def search_best_reranking_controls(
             best_score = score
             best_metrics = metrics
             best_cfg = {
+                "top_k_drafts": int(top_k),
                 "max_drafts": int(max_drafts),
                 "score_margin": float(margin),
                 "relative_ratio": float(ratio),
                 "score_blend_alpha": float(blend_alpha),
             }
 
+    pipeline.top_k_drafts = best_cfg["top_k_drafts"]
     pipeline.set_reranking_controls(
         max_drafts=best_cfg["max_drafts"],
         score_margin=best_cfg["score_margin"],
@@ -1164,6 +1796,7 @@ def search_best_reranking_controls(
     )
 
     if best_metrics is None:
+        pipeline.top_k_drafts = orig_top_k
         pipeline.set_reranking_controls(
             max_drafts=orig_max_drafts,
             score_margin=orig_margin,
@@ -1180,13 +1813,10 @@ def search_best_reranking_controls(
         "metrics": best_metrics,
         "results": results,
     }
-
-
 def evaluate_retrieval_recall(
         pipeline: DraftSplitPipeline,
         items: Sequence[LabeledItem],
 ) -> float:
-    # With full candidate set this becomes a sanity metric rather than a filter metric.
     total = 0
     hit = 0
     for item in items:

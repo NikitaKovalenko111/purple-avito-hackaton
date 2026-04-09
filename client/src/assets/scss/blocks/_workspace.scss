@@ -192,6 +192,11 @@
   color: #1f6a55;
 }
 
+.result-card__decision--no {
+  background: #fde8e8;
+  color: #9b2c2c;
+}
+
 .result-card__text {
   margin-top: 0.55rem;
   color: var(--text-secondary);
@@ -245,6 +250,29 @@
 .side-card__item {
   color: var(--text-secondary);
   font-size: 0.9rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.side-card__session-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.side-card__session-time {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.side-card__session-meta {
+  margin-top: 0.25rem;
+  font-size: 0.84rem;
+  color: var(--text-secondary);
 }
 
 .side-card__buttons {
@@ -260,6 +288,12 @@
   padding: 0.52rem 0.7rem;
   color: var(--text-primary);
   cursor: pointer;
+}
+
+.side-card__button--small {
+  margin-top: 0.45rem;
+  padding: 0.38rem 0.62rem;
+  font-size: 0.82rem;
 }
 
 .side-card__links {
