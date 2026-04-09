@@ -193,6 +193,10 @@ def run_prediction(payload: dict) -> dict:
         for draft in result.drafts
     ]
 
+    if should_split and split_categories:
+        # Keep detected IDs consistent with produced split drafts in split mode.
+        detected_mc_ids = list(dict.fromkeys(int(category["mcId"]) for category in split_categories))
+
     return {
         "detectedMcIds": detected_mc_ids,
         "shouldSplit": should_split,

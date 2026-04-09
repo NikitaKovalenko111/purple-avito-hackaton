@@ -4,6 +4,7 @@ import argparse
 import csv
 import importlib
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -53,6 +54,35 @@ def parse_args() -> argparse.Namespace:
         help="Path to microcategories CSV",
     )
     parser.add_argument("--device", type=str, default=None, help="Force device (cpu/cuda). If omitted, checkpoint/default is used")
+    parser.add_argument(
+        "--use-llm-drafts",
+        action="store_true",
+        help="Generate drafts via OpenRouter LLM (requires OPENROUTER_API_KEY and OPENROUTER_MODEL).",
+    )
+    parser.add_argument(
+        "--openrouter-model",
+        type=str,
+        default=None,
+        help="Override OpenRouter model for LLM draft generation.",
+    )
+    parser.add_argument(
+        "--openrouter-api-key",
+        type=str,
+        default=None,
+        help="Override OpenRouter API key for LLM draft generation.",
+    )
+    parser.add_argument(
+        "--openrouter-base-url",
+        type=str,
+        default=None,
+        help="Override OpenRouter base URL for LLM draft generation.",
+    )
+    parser.add_argument(
+        "--openrouter-timeout-sec",
+        type=float,
+        default=None,
+        help="Override OpenRouter request timeout in seconds.",
+    )
     parser.add_argument("--encoding", type=str, default="utf-8-sig", help="Input/output CSV encoding")
     parser.add_argument("--print-every", type=int, default=100, help="Log progress every N rows")
     return parser.parse_args()
@@ -100,6 +130,44 @@ def _parse_request_payload(raw_request: str) -> Dict[str, Any]:
     return obj
 
 
+def _compute_detected_mc_ids(pipeline: DraftSplitPipeline, item: Item, prediction_payload: Dict[str, Any]) -> List[int]:
+    probabilities = prediction_payload.get("probabilities") or {}
+
+    ranked_detected = sorted(
+        (
+            (int(mc_id), float(score))
+            for mc_id, score in probabilities.items()
+            if int(mc_id) != int(item.mc_id)
+        ),
+        key=lambda x: x[1],
+        reverse=True,
+    )
+
+    detected_mc_ids = [
+        mc_id
+        for mc_id, score in ranked_detected
+        if score >= pipeline.get_class_prob_threshold(mc_id)
+    ]
+
+    if not detected_mc_ids and ranked_detected:
+        detected_mc_ids = [ranked_detected[0][0]]
+
+    if pipeline.top_k_drafts > 0:
+        detected_mc_ids = detected_mc_ids[: pipeline.top_k_drafts]
+
+    if pipeline.max_drafts > 0:
+        detected_mc_ids = detected_mc_ids[: pipeline.max_drafts]
+
+    drafts = prediction_payload.get("drafts")
+    should_split = bool(prediction_payload.get("shouldSplit"))
+    if should_split and isinstance(drafts, list) and drafts:
+        detected_mc_ids = list(
+            dict.fromkeys(int(d["mcId"]) for d in drafts if isinstance(d, dict) and "mcId" in d)
+        )
+
+    return detected_mc_ids
+
+
 def main() -> None:
     _require_torch()
     args = parse_args()
@@ -133,7 +201,26 @@ def main() -> None:
             checkpoint_config.get("split_equals_detected_when_should_split", False)
         ),
         device=args.device,
-        use_llm_drafts=False,
+        use_llm_drafts=bool(args.use_llm_drafts),
+        openrouter_model=str(
+            args.openrouter_model
+            if args.openrouter_model is not None
+            else checkpoint_config.get("openrouter_model")
+            or os.getenv("OPENROUTER_MODEL", "qwen/qwen3.6-plus:free")
+        ),
+        openrouter_api_key=args.openrouter_api_key,
+        openrouter_base_url=str(
+            args.openrouter_base_url
+            if args.openrouter_base_url is not None
+            else checkpoint_config.get("openrouter_base_url")
+            or os.getenv("OPENROUTER_BASE_URL")
+            or os.getenv("LLM_API_URL", "https://openrouter.ai/api/v1/chat/completions")
+        ),
+        openrouter_timeout_sec=float(
+            args.openrouter_timeout_sec
+            if args.openrouter_timeout_sec is not None
+            else checkpoint_config.get("openrouter_timeout_sec", 30.0)
+        ),
     )
 
     pipeline = DraftSplitPipeline(
@@ -145,6 +232,11 @@ def main() -> None:
     if isinstance(class_prob_thresholds, dict) and class_prob_thresholds:
         pipeline.set_class_prob_thresholds({int(k): float(v) for k, v in class_prob_thresholds.items()})
     pipeline.model.eval()
+
+    if args.use_llm_drafts:
+        print(f"LLM drafts enabled: {pipeline.use_llm_drafts}")
+        print(f"OpenRouter model: {pipeline.openrouter_model}")
+        print(f"OpenRouter API key present: {bool(pipeline.openrouter_api_key)}")
 
     with args.input_csv.open("r", encoding=args.encoding, newline="") as f_in:
         reader = csv.DictReader(f_in)
@@ -186,6 +278,15 @@ def main() -> None:
 
         prediction = pipeline.predict(item)
         payload = to_response_json(prediction)
+        payload["detectedMcIds"] = _compute_detected_mc_ids(
+            pipeline=pipeline,
+            item=item,
+            prediction_payload={
+                "probabilities": prediction.probabilities,
+                "shouldSplit": payload.get("shouldSplit", False),
+                "drafts": payload.get("drafts", []),
+            },
+        )
 
         if request_response_mode:
             output_rows.append(
@@ -234,6 +335,14 @@ def main() -> None:
         writer.writerows(output_rows)
 
     print(f"Saved {len(output_rows)} rows to {args.output_csv}")
+    if args.use_llm_drafts:
+        llm_diag = pipeline.get_llm_diagnostics()
+        print(
+            "LLM diagnostics: "
+            f"success={llm_diag.get('success_count', 0)} | "
+            f"fallback={llm_diag.get('fallback_count', 0)} | "
+            f"last_error={llm_diag.get('last_error')}"
+        )
 
 
 if __name__ == "__main__":
