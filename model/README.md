@@ -81,7 +81,7 @@
 - `--epochs`, `--batch-size`, `--lr`, `--weight-decay`
 - `--patience`: early stopping patience
 - `--no-early-stopping`: отключить early stopping
-- `--optimize-for`: `f1` | `precision` | `recall`
+- `--optimize-for`: `f1` | `precision` | `recall` | `composite`
 - `--min-recall`: ограничение при поиске порогов
 
 ### 2.6 Чекпоинты
@@ -186,8 +186,10 @@
 ### 7.1 Обучение (markup_balanced, early stopping)
 
 ```bash
-python run.py --data-dir .\data --dataset-file rnc_dataset_markup_balanced.csv --epochs 10 --batch-size 4 --lr 3e-5 --weight-decay 0.01 --max-length 512 --long-text-mode chunks --long-text-window-tokens 256 --long-text-stride-tokens 192 --long-text-max-windows 4 --split-pos-weight 3.0 --optimize-for recall --min-recall 0.0 --patience 3 --split-target-mode auto --device cuda
+python run.py --data-dir .\data --dataset-file rnc_dataset_markup_balanced.csv --epochs 10 --batch-size 4 --lr 3e-5 --weight-decay 0.01 --max-length 512 --long-text-mode chunks --long-text-window-tokens 256 --long-text-stride-tokens 192 --long-text-max-windows 8 --split-pos-weight 1.5 --optimize-for composite --min-recall 0.0 --patience 3 --split-target-mode auto --device cuda --train-stratified-kfold 3 --cv-source-split train_val --cv-random-state 42 --balance-should-split-batches --batch-false-ratio 0.6 --batch-true-ratio 0.4 --output-dir .\checkpoints --split-equals-detected-when-should-split
 ```
+
+Эта команда является финальной командой обучения.
 
 ### 7.2 Обучение без early stopping
 
@@ -219,6 +221,21 @@ python run.py --data-dir .\data --dataset-file rnc_dataset_markup_balanced.csv -
 
 ```bash
 --device cpu
+```
+
+### 7.6 Прогон rnc_test.csv через root-скрипт
+
+Запускать из корня репозитория:
+
+```bash
+python run_rnc_test.py --output-csv .\test_results.csv
+```
+
+Полезные варианты:
+
+```bash
+python run_rnc_test.py --no-llm-drafts --output-csv .\test_results.csv
+python run_rnc_test.py --checkpoint-path .\model\checkpoints\cv_best_fold_checkpoint.pt --output-csv .\test_results.csv
 ```
 
 ---
