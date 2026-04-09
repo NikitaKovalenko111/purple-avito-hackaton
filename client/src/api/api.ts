@@ -3,13 +3,14 @@ import axios from 'axios'
 import { socketDraftReady, socketPredictDone, type Prediction, type PredictionRequest } from '../types'
 import { socketService } from './socketManager'
 import { store } from '../redux/store'
-import { addDraft, setPrediction } from '../redux/features/prediction/prediction'
+import { addDraft, setLastRequest, setPrediction } from '../redux/features/prediction/prediction'
 
 const instance = axios.create({
     baseURL: 'http://localhost:8000'
 })
 
 export const getPrediction = async (predictionData: PredictionRequest) => {
+    store.dispatch(setLastRequest(predictionData))
     const response = await instance.post<Prediction>('/predict/', predictionData)
     const prediction = response.data
 

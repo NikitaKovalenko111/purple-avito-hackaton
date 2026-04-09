@@ -33,3 +33,10 @@ export interface Draft {
     mcTitle: string
     text: string
 }
+
+export interface PredictionSession {
+    id: string
+    createdAt: string
+    request: PredictionRequest
+    response: Prediction
+}

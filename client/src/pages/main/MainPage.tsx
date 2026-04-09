@@ -1,14 +1,18 @@
-import { useState, type JSX } from "react";
+import { useEffect, useState, type JSX } from "react";
 import type React from "react";
-import { useSelector } from "react-redux";
+import { useDispatch, useSelector } from "react-redux";
 import { Link } from "react-router-dom";
 import { type RootState } from "../../redux/store";
-import { categoriesRefs, type Draft } from "../../types";
+import { categoriesRefs, type Draft, type PredictionSession } from "../../types";
 import { getPrediction } from "../../api/api";
+import { setPrediction } from "../../redux/features/prediction/prediction";
+import { loadPredictionSessions, subscribePredictionSessionsUpdated } from "../../utils/predictionSessions";
 
 type PropsType = {}
 
 const MainPage: React.FC<PropsType> = (): JSX.Element => {
+    const dispatch = useDispatch()
+    const prediction = useSelector((state: RootState) => state.prediction.prediction)
     const categories = useSelector((state: RootState) => state.prediction.prediction?.detectedMcIds)
     const shouldSplit = useSelector((state: RootState) => state.prediction.prediction?.shouldSplit)
     const drafts = useSelector((state: RootState) => state.prediction.prediction?.drafts)
@@ -16,6 +20,22 @@ const MainPage: React.FC<PropsType> = (): JSX.Element => {
     const [description, setDescription] = useState<string>("")
     const [sourceMcId, setSourceMcId] = useState<number>(101)
     const [isLoading, setIsLoading] = useState<boolean>(false)
+    const [recentSessions, setRecentSessions] = useState<PredictionSession[]>([])
+
+    useEffect(() => {
+        const refreshSessions = () => {
+            setRecentSessions(loadPredictionSessions())
+        }
+
+        refreshSessions()
+        const unsubscribe = subscribePredictionSessionsUpdated(refreshSessions)
+        return unsubscribe
+    }, [])
+
+    const handleReset = () => {
+        setDescription("")
+        setSourceMcId(101)
+    }
 
     const handleAnalyze = async () => {
         if (!description.trim() || isLoading) {
@@ -34,6 +54,19 @@ const MainPage: React.FC<PropsType> = (): JSX.Element => {
         } finally {
             setIsLoading(false)
         }
+    }
+
+    const openRecentSession = (session: PredictionSession) => {
+        setSourceMcId(session.request.sourceMcId)
+        setDescription(session.request.description)
+        dispatch(setPrediction(session.response))
+    }
+
+    const formatSessionTime = (iso: string): string => {
+        const date = new Date(iso)
+        return Number.isNaN(date.getTime())
+            ? ""
+            : date.toLocaleString("ru-RU", { dateStyle: "short", timeStyle: "short" })
     }
 
     return (
@@ -113,46 +146,55 @@ const MainPage: React.FC<PropsType> = (): JSX.Element => {
                         >
                             {isLoading ? "Анализ..." : "Анализ"}
                         </button>
-                        <button className="ad-form__button ad-form__button--ghost" type="button">Сбросить</button>
+                        <button onClick={handleReset} className="ad-form__button ad-form__button--ghost" type="button">Сбросить</button>
                         </div>
                     </form>
                     </section>
 
                     <section className="panel panel--results" aria-labelledby="panel-results-title">
                     <h2 className="panel__title" id="panel-results-title">Ответ модели</h2>
-
-                    <article className="result-card">
-                        <h3 className="result-card__title">Найденные микрокатегории</h3>
-                        <ul className="result-card__chips">
-                        {categories?.map((el) => (
-                            <li className="result-card__chip" key={el}>
-                                {el} {categoriesRefs[el] ?? "Неизвестная категория"}
-                            </li>
-                        ))}
-                        </ul>
-                    </article>
-
-                    <article className="result-card">
-                        <h3 className="result-card__title">Следует разделить?</h3>
-                        <p className={`result-card__decision ${shouldSplit ? 'result-card__decision--yes' : 'result-card__decision--no'}`}>Нужно разделить: {shouldSplit ? 'Да' : 'Нет'}</p>
-                        {/*<p className="result-card__text">3 микрокатегории превысили порог и отличны от исходной категории</p>*/}
-                    </article>
-
-                    <article className="result-card">
-                        <h3 className="result-card__title">Черновики</h3>
-                        <ul className="result-card__drafts">
-                        {
-                            drafts?.map((el: Draft) => {
-                                return (
-                                    <li className="result-card__draft" key={`${el.mcId}-${el.mcTitle}`}>
-                                        <h4 className="result-card__draft-title">{el.mcId} {el.mcTitle}</h4>
-                                        <p className="result-card__draft-text">{el.text}</p>
+                    {
+                        prediction != null ? (
+                            <>
+                            <article className="result-card">
+                                <h3 className="result-card__title">Найденные микрокатегории</h3>
+                                <ul className="result-card__chips">
+                                {categories?.map((el) => (
+                                    <li className="result-card__chip" key={el}>
+                                        {el} {categoriesRefs[el] ?? "Неизвестная категория"}
                                     </li>
-                                )
-                            })
-                        }
-                        </ul>
-                    </article>
+                                ))}
+                                </ul>
+                            </article>
+
+                            <article className="result-card">
+                                <h3 className="result-card__title">Следует разделить?</h3>
+                                <p className={`result-card__decision ${shouldSplit ? 'result-card__decision--yes' : 'result-card__decision--no'}`}>Нужно разделить: {shouldSplit ? 'Да' : 'Нет'}</p>
+                                {/*<p className="result-card__text">3 микрокатегории превысили порог и отличны от исходной категории</p>*/}
+                            </article>
+
+                            <article className="result-card">
+                                <h3 className="result-card__title">Черновики</h3>
+                                <ul className="result-card__drafts">
+                                {
+                                    drafts?.map((el: Draft) => {
+                                        return (
+                                            <li className="result-card__draft" key={`${el.mcId}-${el.mcTitle}`}>
+                                                <h4 className="result-card__draft-title">{el.mcId} {el.mcTitle}</h4>
+                                                <p className="result-card__draft-text">{el.text}</p>
+                                            </li>
+                                        )
+                                    })
+                                }
+                                </ul>
+                            </article>
+                            </>
+                        ) : (
+                            <article className="result-card">
+                                <h3 className="result-card__title">Ответа модели пока нет</h3>
+                            </article>
+                        )
+                    }
                     </section>
 
                     <aside className="panel panel--side" aria-labelledby="panel-side-title">
@@ -161,18 +203,31 @@ const MainPage: React.FC<PropsType> = (): JSX.Element => {
                     <article className="side-card">
                         <h3 className="side-card__title">Недавние сессии</h3>
                         <ul className="side-card__list">
-                        <li className="side-card__item">Объявление 5001 - разделение: да</li>
-                        <li className="side-card__item">Объявление 5002 - разделение: нет</li>
-                        <li className="side-card__item">Объявление 5003 - разделение: да</li>
+                        {recentSessions.length === 0 ? (
+                            <li className="side-card__item">Сессий пока нет</li>
+                        ) : (
+                            recentSessions.slice(0, 8).map((session) => (
+                                <li className="side-card__item" key={session.id}>
+                                    <div className="side-card__session-head">
+                                        <span>
+                                            {session.request.sourceMcId} - {categoriesRefs[session.request.sourceMcId] ?? session.request.sourceMcTitle}
+                                        </span>
+                                        <span className="side-card__session-time"> {formatSessionTime(session.createdAt)}</span>
+                                    </div>
+                                    <div className="side-card__session-meta">
+                                        Разделение: {session.response.shouldSplit ? "да" : "нет"}, черновиков: {session.response.drafts.length}
+                                    </div>
+                                    <button
+                                        className="side-card__button side-card__button--small"
+                                        type="button"
+                                        onClick={() => openRecentSession(session)}
+                                    >
+                                        Открыть
+                                    </button>
+                                </li>
+                            ))
+                        )}
                         </ul>
-                    </article>
-
-                    <article className="side-card">
-                        <h3 className="side-card__title">Экспорт настроек</h3>
-                        <div className="side-card__buttons">
-                        <button className="side-card__button" type="button">Скачать JSON</button>
-                        <button className="side-card__button" type="button">Скачать</button>
-                        </div>
                     </article>
 
                     <article className="side-card">
