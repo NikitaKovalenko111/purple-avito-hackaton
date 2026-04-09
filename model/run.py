@@ -4,6 +4,7 @@ import argparse
 import importlib
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -17,6 +18,7 @@ def _optional_import(module_name: str) -> Any:
 
 torch = _optional_import("torch")
 AdamW = getattr(_optional_import("torch.optim"), "AdamW", None)
+sklearn_model_selection = _optional_import("sklearn.model_selection")
 
 from model import (
     DraftSplitPipeline,
@@ -40,6 +42,11 @@ from model import (
 def _require_torch() -> None:
     if torch is None or AdamW is None:
         raise ImportError("PyTorch is required. Install with: pip install torch")
+
+
+def _require_stratified_kfold() -> None:
+    if sklearn_model_selection is None or not hasattr(sklearn_model_selection, "StratifiedKFold"):
+        raise ImportError("scikit-learn is required for StratifiedKFold. Install with: pip install scikit-learn")
 
 
 DEFAULT_THRESHOLD_GRID: tuple[float, ...] = (0.08, 0.12, 0.16, 0.20, 0.24)
@@ -318,7 +325,60 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Train for all epochs without validation-based early stopping.",
     )
+    parser.add_argument(
+        "--train-stratified-kfold",
+        type=int,
+        default=0,
+        help="If >1, run training with StratifiedKFold by shouldSplit and report aggregated fold metrics.",
+    )
+    parser.add_argument(
+        "--cv-source-split",
+        choices=["train", "train_val", "all"],
+        default="train_val",
+        help="Subset used as pool for KFold training/validation.",
+    )
+    parser.add_argument(
+        "--cv-random-state",
+        type=int,
+        default=42,
+        help="Random state for StratifiedKFold shuffle.",
+    )
     return parser.parse_args()
+
+
+def _mean(values: List[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _std(values: List[float]) -> float:
+    if len(values) <= 1:
+        return 0.0
+    mean = _mean(values)
+    var = sum((x - mean) ** 2 for x in values) / len(values)
+    return var ** 0.5
+
+
+def _collect_numeric(prefix: str, obj: Any, out: Dict[str, float]) -> None:
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            next_prefix = f"{prefix}.{key}" if prefix else str(key)
+            _collect_numeric(next_prefix, value, out)
+        return
+    if isinstance(obj, (int, float)):
+        out[prefix] = float(obj)
+
+
+def _aggregate_fold_metrics(folds: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
+    series: Dict[str, List[float]] = {}
+    for fold in folds:
+        flat: Dict[str, float] = {}
+        _collect_numeric("", fold, flat)
+        for key, value in flat.items():
+            series.setdefault(key, []).append(value)
+
+    mean_metrics = {k: _mean(v) for k, v in series.items()}
+    std_metrics = {k: _std(v) for k, v in series.items()}
+    return {"mean": mean_metrics, "std": std_metrics}
 
 
 def load_items(data_dir: Path, use_jsonl: bool, dataset_file: Path | None = None) -> List[object]:
@@ -519,6 +579,182 @@ def main() -> None:
         min_recall=float(args.min_recall),
         cross_encoder_loss_weight=float(args.cross_encoder_loss_weight),
     )
+
+    if args.train_stratified_kfold > 1:
+        if checkpoint_mode:
+            raise ValueError("--train-stratified-kfold cannot be used with --checkpoint-path (training is skipped in checkpoint mode).")
+
+        _require_stratified_kfold()
+
+        if args.cv_source_split == "train":
+            cv_pool = list(train_items)
+        elif args.cv_source_split == "all":
+            cv_pool = list(items)
+        else:
+            cv_pool = list(train_items) + list(val_items)
+
+        if not cv_pool:
+            raise ValueError(f"No data available for CV pool='{args.cv_source_split}'.")
+
+        cv_labels = [1 if bool(x.should_split) else 0 for x in cv_pool]
+        positives = sum(cv_labels)
+        negatives = len(cv_labels) - positives
+        if positives < args.train_stratified_kfold or negatives < args.train_stratified_kfold:
+            raise ValueError(
+                "Not enough samples per class for StratifiedKFold: "
+                f"positives={positives}, negatives={negatives}, n_splits={args.train_stratified_kfold}"
+            )
+
+        skf = sklearn_model_selection.StratifiedKFold(
+            n_splits=args.train_stratified_kfold,
+            shuffle=True,
+            random_state=args.cv_random_state,
+        )
+
+        fold_reports: List[Dict[str, Any]] = []
+        print(
+            f"Running StratifiedKFold training: n_splits={args.train_stratified_kfold}, "
+            f"pool={args.cv_source_split}, size={len(cv_pool)}"
+        )
+
+        for fold_idx, (fold_train_idx, fold_val_idx) in enumerate(skf.split(cv_pool, cv_labels), start=1):
+            fold_train_items = [cv_pool[i] for i in fold_train_idx]
+            fold_val_items = [cv_pool[i] for i in fold_val_idx]
+
+            fold_pipeline = DraftSplitPipeline(
+                microcategories=microcategories,
+                settings=replace(pipeline_settings),
+            )
+            if args.init_from_checkpoint is not None:
+                fold_pipeline.model.load_state_dict(init_checkpoint["model_state"], strict=False)
+
+            fold_pipeline.use_llm_drafts = False
+            fold_optimizer = AdamW(
+                fold_pipeline.model.parameters(),
+                lr=training_settings.lr,
+                weight_decay=training_settings.weight_decay,
+            )
+
+            print(
+                f"\n[Fold {fold_idx}/{args.train_stratified_kfold}] "
+                f"train={len(fold_train_items)} val={len(fold_val_items)}"
+            )
+
+            if args.no_early_stopping:
+                fold_pipeline.train_on_labeled_items(
+                    items=fold_train_items,
+                    optimizer=fold_optimizer,
+                    batch_size=training_settings.batch_size,
+                    epochs=training_settings.epochs,
+                    split_loss_weight=training_settings.split_loss_weight,
+                    split_pos_weight=training_settings.split_pos_weight,
+                    cross_encoder_loss_weight=training_settings.cross_encoder_loss_weight,
+                    verbose=True,
+                )
+            else:
+                fold_pipeline.fit_with_early_stopping(
+                    train_items=fold_train_items,
+                    val_items=fold_val_items,
+                    optimizer=fold_optimizer,
+                    training_settings=training_settings,
+                )
+
+            fold_threshold_report = search_best_probability_threshold(
+                fold_pipeline,
+                fold_val_items,
+                training_settings.threshold_grid,
+                optimize_for=args.optimize_for,
+                min_recall=args.min_recall,
+            )
+            fold_pipeline.prob_threshold = fold_threshold_report["threshold"]
+
+            fold_split_threshold_report = evaluate_split_probability_threshold(
+                fold_pipeline,
+                fold_val_items,
+                args.split_threshold_grid,
+                optimize_for=args.optimize_for,
+                min_recall=args.min_recall,
+            )
+            fold_pipeline.split_threshold = fold_split_threshold_report["threshold"]
+
+            fold_class_threshold_report = search_best_class_probability_thresholds(
+                fold_pipeline,
+                fold_val_items,
+                args.class_threshold_grid,
+                optimize_for=args.optimize_for,
+                min_recall=args.min_recall,
+            )
+            fold_pipeline.set_class_prob_thresholds(fold_class_threshold_report["class_thresholds"])
+
+            fold_reranking_report = search_best_reranking_controls(
+                fold_pipeline,
+                fold_val_items,
+                args.top_k_drafts_grid,
+                args.max_drafts_grid,
+                args.score_margin_grid,
+                args.relative_ratio_grid,
+                args.score_blend_alpha_grid,
+                optimize_for=args.optimize_for,
+                min_recall=args.min_recall,
+            )
+            fold_best_controls = fold_reranking_report["best_controls"]
+            fold_pipeline.top_k_drafts = fold_best_controls["top_k_drafts"]
+            fold_pipeline.set_reranking_controls(
+                max_drafts=fold_best_controls["max_drafts"],
+                score_margin=fold_best_controls["score_margin"],
+                relative_ratio=fold_best_controls["relative_ratio"],
+                score_blend_alpha=fold_best_controls["score_blend_alpha"],
+            )
+
+            fold_split_metrics = evaluate_split_quality(fold_pipeline, fold_val_items)
+            fold_detect_metrics = evaluate_detect_quality(fold_pipeline, fold_val_items)
+            fold_retrieval_recall = evaluate_retrieval_recall(fold_pipeline, fold_val_items)
+
+            fold_report = {
+                "fold": fold_idx,
+                "train_size": len(fold_train_items),
+                "val_size": len(fold_val_items),
+                "thresholds": {
+                    "prob_threshold": fold_pipeline.prob_threshold,
+                    "split_threshold": fold_pipeline.split_threshold,
+                },
+                "split_metrics": fold_split_metrics,
+                "detect_metrics": fold_detect_metrics,
+                "retrieval_recall": fold_retrieval_recall,
+            }
+            fold_reports.append(fold_report)
+
+            print(
+                f"[Fold {fold_idx}] split_f1={fold_split_metrics['f1_micro']:.4f} "
+                f"shouldSplit_acc={fold_split_metrics['should_split_accuracy']:.4f} "
+                f"detect_f1={fold_detect_metrics['f1_micro']:.4f}"
+            )
+
+        aggregate = _aggregate_fold_metrics(fold_reports)
+        print("\nStratifiedKFold aggregate mean ± std:")
+        for key, mean_value in sorted(aggregate["mean"].items()):
+            std_value = aggregate["std"].get(key, 0.0)
+            print(f"  {key}: {mean_value:.4f} ± {std_value:.4f}")
+
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        cv_report_path = output_dir / "cv_training_report.json"
+        with cv_report_path.open("w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "mode": "train_stratified_kfold",
+                    "n_splits": args.train_stratified_kfold,
+                    "cv_source_split": args.cv_source_split,
+                    "cv_random_state": args.cv_random_state,
+                    "folds": fold_reports,
+                    "aggregate": aggregate,
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+        print(f"CV report saved to {cv_report_path}")
+        return
 
     pipeline = DraftSplitPipeline(
         microcategories=microcategories,

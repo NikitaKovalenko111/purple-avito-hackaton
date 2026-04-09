@@ -1384,14 +1384,7 @@ class DraftSplitPipeline:
         ]
         selected.sort(key=lambda x: x[1], reverse=True)
         target_mc_ids = self._apply_reranking_controls(selected)
-        candidate_support = 0.0
-        if target_mc_ids:
-            top_candidate_score = max(float(score) for _, score in selected[: max(1, len(target_mc_ids))])
-            candidate_density = min(1.0, len(target_mc_ids) / 4.0)
-            candidate_support = max(top_candidate_score, candidate_density)
-
-        split_score = 0.75 * split_prob + 0.25 * candidate_support
-        should_split = split_score >= self.split_threshold
+        should_split = split_prob >= self.split_threshold
         if not should_split:
             target_mc_ids = []
         elif self.split_equals_detected_when_should_split:
