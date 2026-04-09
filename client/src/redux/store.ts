@@ -1,7 +1,10 @@
 import { configureStore } from '@reduxjs/toolkit'
+import predictionReducer from './features/prediction/prediction'
 
 export const store = configureStore({
-  reducer: {},
+  reducer: {
+    prediction: predictionReducer
+  },
 })
 
 export type RootState = ReturnType<typeof store.getState>

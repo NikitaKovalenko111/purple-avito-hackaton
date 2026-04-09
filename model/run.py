@@ -343,6 +343,42 @@ def parse_args() -> argparse.Namespace:
         default=42,
         help="Random state for StratifiedKFold shuffle.",
     )
+    parser.add_argument(
+        "--balance-should-split-batches",
+        action="store_true",
+        help="Use per-epoch resampling for shouldSplit labels in train batches.",
+    )
+    parser.add_argument(
+        "--batch-false-ratio",
+        type=float,
+        default=0.7,
+        help="Target ratio of shouldSplit=false samples in resampled train epochs.",
+    )
+    parser.add_argument(
+        "--batch-true-ratio",
+        type=float,
+        default=0.3,
+        help="Target ratio of shouldSplit=true samples in resampled train epochs.",
+    )
+    parser.add_argument(
+        "--cv-full-tuning",
+        action="store_true",
+        help="Enable full (slow) k-fold tuning including class-threshold and reranking grid search.",
+    )
+    parser.add_argument(
+        "--cv-fast-threshold-grid",
+        type=float,
+        nargs="+",
+        default=[0.05, 0.08],
+        help="Fast k-fold grid for prob_threshold tuning.",
+    )
+    parser.add_argument(
+        "--cv-fast-split-threshold-grid",
+        type=float,
+        nargs="+",
+        default=[0.35, 0.45],
+        help="Fast k-fold grid for shouldSplit threshold tuning.",
+    )
     return parser.parse_args()
 
 
@@ -578,6 +614,9 @@ def main() -> None:
         optimize_for=args.optimize_for,
         min_recall=float(args.min_recall),
         cross_encoder_loss_weight=float(args.cross_encoder_loss_weight),
+        balance_should_split_batches=bool(args.balance_should_split_batches),
+        batch_false_ratio=float(args.batch_false_ratio),
+        batch_true_ratio=float(args.batch_true_ratio),
     )
 
     if args.train_stratified_kfold > 1:
@@ -617,6 +656,21 @@ def main() -> None:
             f"pool={args.cv_source_split}, size={len(cv_pool)}"
         )
 
+        if args.cv_full_tuning:
+            fold_training_settings = replace(training_settings)
+            print("KFold tuning mode: full (slow)")
+        else:
+            fold_training_settings = replace(
+                training_settings,
+                threshold_grid=tuple(args.cv_fast_threshold_grid),
+                split_threshold_grid=tuple(args.cv_fast_split_threshold_grid),
+            )
+            print(
+                "KFold tuning mode: fast | "
+                f"threshold_grid={list(fold_training_settings.threshold_grid)} | "
+                f"split_threshold_grid={list(fold_training_settings.split_threshold_grid)}"
+            )
+
         for fold_idx, (fold_train_idx, fold_val_idx) in enumerate(skf.split(cv_pool, cv_labels), start=1):
             fold_train_items = [cv_pool[i] for i in fold_train_idx]
             fold_val_items = [cv_pool[i] for i in fold_val_idx]
@@ -644,11 +698,14 @@ def main() -> None:
                 fold_pipeline.train_on_labeled_items(
                     items=fold_train_items,
                     optimizer=fold_optimizer,
-                    batch_size=training_settings.batch_size,
-                    epochs=training_settings.epochs,
-                    split_loss_weight=training_settings.split_loss_weight,
-                    split_pos_weight=training_settings.split_pos_weight,
-                    cross_encoder_loss_weight=training_settings.cross_encoder_loss_weight,
+                    batch_size=fold_training_settings.batch_size,
+                    epochs=fold_training_settings.epochs,
+                    split_loss_weight=fold_training_settings.split_loss_weight,
+                    split_pos_weight=fold_training_settings.split_pos_weight,
+                    cross_encoder_loss_weight=fold_training_settings.cross_encoder_loss_weight,
+                    balance_should_split_batches=fold_training_settings.balance_should_split_batches,
+                    batch_false_ratio=fold_training_settings.batch_false_ratio,
+                    batch_true_ratio=fold_training_settings.batch_true_ratio,
                     verbose=True,
                 )
             else:
@@ -656,55 +713,60 @@ def main() -> None:
                     train_items=fold_train_items,
                     val_items=fold_val_items,
                     optimizer=fold_optimizer,
-                    training_settings=training_settings,
+                    training_settings=fold_training_settings,
                 )
 
+            print(f"[Fold {fold_idx}] tuning prob_threshold...")
             fold_threshold_report = search_best_probability_threshold(
                 fold_pipeline,
                 fold_val_items,
-                training_settings.threshold_grid,
+                fold_training_settings.threshold_grid,
                 optimize_for=args.optimize_for,
                 min_recall=args.min_recall,
             )
             fold_pipeline.prob_threshold = fold_threshold_report["threshold"]
 
+            print(f"[Fold {fold_idx}] tuning split_threshold...")
             fold_split_threshold_report = evaluate_split_probability_threshold(
                 fold_pipeline,
                 fold_val_items,
-                args.split_threshold_grid,
+                fold_training_settings.split_threshold_grid,
                 optimize_for=args.optimize_for,
                 min_recall=args.min_recall,
             )
             fold_pipeline.split_threshold = fold_split_threshold_report["threshold"]
 
-            fold_class_threshold_report = search_best_class_probability_thresholds(
-                fold_pipeline,
-                fold_val_items,
-                args.class_threshold_grid,
-                optimize_for=args.optimize_for,
-                min_recall=args.min_recall,
-            )
-            fold_pipeline.set_class_prob_thresholds(fold_class_threshold_report["class_thresholds"])
+            if args.cv_full_tuning:
+                print(f"[Fold {fold_idx}] tuning class thresholds...")
+                fold_class_threshold_report = search_best_class_probability_thresholds(
+                    fold_pipeline,
+                    fold_val_items,
+                    args.class_threshold_grid,
+                    optimize_for=args.optimize_for,
+                    min_recall=args.min_recall,
+                )
+                fold_pipeline.set_class_prob_thresholds(fold_class_threshold_report["class_thresholds"])
 
-            fold_reranking_report = search_best_reranking_controls(
-                fold_pipeline,
-                fold_val_items,
-                args.top_k_drafts_grid,
-                args.max_drafts_grid,
-                args.score_margin_grid,
-                args.relative_ratio_grid,
-                args.score_blend_alpha_grid,
-                optimize_for=args.optimize_for,
-                min_recall=args.min_recall,
-            )
-            fold_best_controls = fold_reranking_report["best_controls"]
-            fold_pipeline.top_k_drafts = fold_best_controls["top_k_drafts"]
-            fold_pipeline.set_reranking_controls(
-                max_drafts=fold_best_controls["max_drafts"],
-                score_margin=fold_best_controls["score_margin"],
-                relative_ratio=fold_best_controls["relative_ratio"],
-                score_blend_alpha=fold_best_controls["score_blend_alpha"],
-            )
+                print(f"[Fold {fold_idx}] tuning reranking controls...")
+                fold_reranking_report = search_best_reranking_controls(
+                    fold_pipeline,
+                    fold_val_items,
+                    args.top_k_drafts_grid,
+                    args.max_drafts_grid,
+                    args.score_margin_grid,
+                    args.relative_ratio_grid,
+                    args.score_blend_alpha_grid,
+                    optimize_for=args.optimize_for,
+                    min_recall=args.min_recall,
+                )
+                fold_best_controls = fold_reranking_report["best_controls"]
+                fold_pipeline.top_k_drafts = fold_best_controls["top_k_drafts"]
+                fold_pipeline.set_reranking_controls(
+                    max_drafts=fold_best_controls["max_drafts"],
+                    score_margin=fold_best_controls["score_margin"],
+                    relative_ratio=fold_best_controls["relative_ratio"],
+                    score_blend_alpha=fold_best_controls["score_blend_alpha"],
+                )
 
             fold_split_metrics = evaluate_split_quality(fold_pipeline, fold_val_items)
             fold_detect_metrics = evaluate_detect_quality(fold_pipeline, fold_val_items)
@@ -802,6 +864,9 @@ def main() -> None:
                     split_loss_weight=training_settings.split_loss_weight,
                     split_pos_weight=training_settings.split_pos_weight,
                     cross_encoder_loss_weight=training_settings.cross_encoder_loss_weight,
+                    balance_should_split_batches=training_settings.balance_should_split_batches,
+                    batch_false_ratio=training_settings.batch_false_ratio,
+                    batch_true_ratio=training_settings.batch_true_ratio,
                     verbose=False,
                 )[-1]
                 losses.append(epoch_loss)
@@ -836,6 +901,9 @@ def main() -> None:
             epochs=training_settings.epochs,
             split_loss_weight=training_settings.split_loss_weight,
             split_pos_weight=training_settings.split_pos_weight,
+            balance_should_split_batches=training_settings.balance_should_split_batches,
+            batch_false_ratio=training_settings.batch_false_ratio,
+            batch_true_ratio=training_settings.batch_true_ratio,
             # cross-encoder loss is handled inside train_step through pipeline settings
             # cross-encoder loss is handled inside train_step through pipeline settings
             verbose=True,

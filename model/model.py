@@ -8,6 +8,7 @@ import importlib
 import itertools
 import json
 import os
+import random
 import re
 import unicodedata
 from pathlib import Path
@@ -163,6 +164,9 @@ class TrainingSettings:
     optimize_for: str = "f1"
     min_recall: float = 0.0
     cross_encoder_loss_weight: float = 0.5
+    balance_should_split_batches: bool = False
+    batch_false_ratio: float = 0.7
+    batch_true_ratio: float = 0.3
 
 
 def _parse_int_list(raw_value: Any) -> List[int]:
@@ -1016,6 +1020,9 @@ class DraftSplitPipeline:
             split_loss_weight: float = 0.5,
             split_pos_weight: float = 5.0,
             cross_encoder_loss_weight: float = 0.5,
+                balance_should_split_batches: bool = False,
+                batch_false_ratio: float = 0.7,
+                batch_true_ratio: float = 0.3,
             log_epoch: Optional[int] = None,
             log_total_epochs: Optional[int] = None,
             verbose: bool = False,
@@ -1024,15 +1031,36 @@ class DraftSplitPipeline:
         if batch_size <= 0:
             raise ValueError("batch_size must be > 0")
 
+        def _build_epoch_items() -> List[LabeledItem]:
+            if not balance_should_split_batches:
+                return list(items)
+
+            negatives = [x for x in items if not bool(x.should_split)]
+            positives = [x for x in items if bool(x.should_split)]
+            if not negatives or not positives:
+                return list(items)
+
+            total = len(items)
+            ratio_sum = max(1e-6, float(batch_false_ratio) + float(batch_true_ratio))
+            neg_target = int(round(total * float(batch_false_ratio) / ratio_sum))
+            neg_target = max(0, min(neg_target, len(negatives)))
+            pos_target = max(0, total - neg_target)
+
+            epoch_items = random.sample(negatives, k=neg_target)
+            epoch_items.extend(random.choices(positives, k=pos_target))
+            random.shuffle(epoch_items)
+            return epoch_items
+
         total_steps = (len(items) + batch_size - 1) // batch_size if items else 0
         for _ in range(epochs):
+            epoch_items = _build_epoch_items()
             epoch_index = len(history) + 1
             display_epoch = log_epoch if log_epoch is not None else epoch_index
             display_total_epochs = log_total_epochs if log_total_epochs is not None else epochs
             epoch_loss = 0.0
             steps = 0
-            for i in range(0, len(items), batch_size):
-                batch = items[i: i + batch_size]
+            for i in range(0, len(epoch_items), batch_size):
+                batch = epoch_items[i: i + batch_size]
                 texts = [x.description for x in batch]
                 candidates = [
                     self.build_candidates(
@@ -1101,11 +1129,16 @@ class DraftSplitPipeline:
                 split_loss_weight=settings.split_loss_weight,
                 split_pos_weight=settings.split_pos_weight,
                 cross_encoder_loss_weight=settings.cross_encoder_loss_weight,
+                balance_should_split_batches=settings.balance_should_split_batches,
+                batch_false_ratio=settings.batch_false_ratio,
+                batch_true_ratio=settings.batch_true_ratio,
                 log_epoch=epoch,
                 log_total_epochs=settings.epochs,
                 verbose=verbose,
             )
             loss_value = loss_history[-1] if loss_history else 0.0
+            if verbose:
+                print(f"Epoch {epoch}/{settings.epochs} | tuning prob_threshold on val...")
             threshold_report = search_best_probability_threshold(
                 self,
                 val_items,
@@ -1114,6 +1147,8 @@ class DraftSplitPipeline:
                 min_recall=settings.min_recall,
             )
             self.prob_threshold = threshold_report["threshold"]
+            if verbose:
+                print(f"Epoch {epoch}/{settings.epochs} | tuning split_threshold on val...")
             split_threshold_report = evaluate_split_probability_threshold(
                 self,
                 val_items,

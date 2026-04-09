@@ -10,6 +10,7 @@ from .serializers import PredictRequestSerializer
 from .tasks import generate_drafts
 from .model_service import run_prediction
 from .storage import REQUEST_STORE
+from .llm_service import generate_draft_with_llm
 
 
 
@@ -48,4 +49,45 @@ class PredictView(APIView):
                 "drafts": [],
             },
             status=status.HTTP_202_ACCEPTED,
+        )
+
+
+class PredictSyncView(APIView):
+    """Predict and return all drafts in a single HTTP response (no websocket streaming)."""
+
+    def post(self, request):
+        serializer = PredictRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        prediction = run_prediction(data)
+        split_categories = prediction["splitCategories"]
+
+        drafts = []
+        for category in split_categories:
+            try:
+                text = generate_draft_with_llm(data, category)
+            except Exception as exc:
+                # Keep endpoint resilient even if LLM provider fails for one draft.
+                text = (
+                    f"Черновик для категории '{category.get('mcTitle', '')}'. "
+                    f"Описание: {str(data.get('description', ''))[:160]}"
+                )
+                print(f"[PREDICT_SYNC] draft generation error mcId={category.get('mcId')} error={exc}")
+
+            drafts.append(
+                {
+                    "mcId": category["mcId"],
+                    "mcTitle": category["mcTitle"],
+                    "text": text,
+                }
+            )
+
+        return Response(
+            {
+                "detectedMcIds": prediction["detectedMcIds"],
+                "shouldSplit": prediction["shouldSplit"],
+                "drafts": drafts,
+            },
+            status=status.HTTP_200_OK,
         )

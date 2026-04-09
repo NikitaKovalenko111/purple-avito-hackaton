@@ -10,21 +10,36 @@ const DatasetPage: React.FC<PropsType> = (): JSX.Element => {
                 <div className="info__container container">
                 <header className="info__head">
                     <p className="info__eyebrow">Документация датасета</p>
-                    <h1 className="info__title" id="info-title-dataset">Детали синтетического бенчмарка</h1>
+                    <h1 className="info__title" id="info-title-dataset">Текущий датасет: markup_balanced</h1>
                 </header>
 
                 <div className="stat-grid">
                     <article className="stat-card">
                     <p className="stat-card__label">Строк</p>
-                    <p className="stat-card__value">3,000</p>
+                    <p className="stat-card__value">2,480</p>
                     </article>
                     <article className="stat-card">
                     <p className="stat-card__label">Микрокатегорий</p>
-                    <p className="stat-card__value">11</p>
+                    <p className="stat-card__value">11 (целевые 10)</p>
                     </article>
                     <article className="stat-card">
                     <p className="stat-card__label">Доля split=True</p>
-                    <p className="stat-card__value">37.1%</p>
+                    <p className="stat-card__value">19.0%</p>
+                    </article>
+                </div>
+
+                <div className="stat-grid">
+                    <article className="stat-card">
+                    <p className="stat-card__label">Train / Val / Test</p>
+                    <p className="stat-card__value">1736 / 372 / 372</p>
+                    </article>
+                    <article className="stat-card">
+                    <p className="stat-card__label">Источник (sourceMcId)</p>
+                    <p className="stat-card__value">101</p>
+                    </article>
+                    <article className="stat-card">
+                    <p className="stat-card__label">Семантика split</p>
+                    <p className="stat-card__value">split==detected при shouldSplit=True</p>
                     </article>
                 </div>
 
@@ -48,11 +63,11 @@ const DatasetPage: React.FC<PropsType> = (): JSX.Element => {
                         </tr>
                         <tr>
                         <td>targetSplitMcIds</td>
-                        <td>Микрокатегории для создания дополнительных черновиков</td>
+                        <td>Для markup_balanced совпадает с targetDetectedMcIds, если shouldSplit=True</td>
                         </tr>
                         <tr>
                         <td>shouldSplit</td>
-                        <td>Бинарный флаг необходимости создания черновиков</td>
+                        <td>Бинарный флаг: создавать дополнительные черновики или нет</td>
                         </tr>
                         <tr>
                         <td>split</td>

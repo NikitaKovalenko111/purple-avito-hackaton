@@ -3,28 +3,36 @@ import axios from 'axios'
 import { socketDraftReady, socketPredictDone, type Prediction, type PredictionRequest } from '../types'
 import { socketService } from './socketManager'
 import { store } from '../redux/store'
-import { addDraft } from '../redux/features/prediction/prediction'
+import { addDraft, setPrediction } from '../redux/features/prediction/prediction'
 
 const instance = axios.create({
     baseURL: 'http://localhost:8000'
 })
 
 export const getPrediction = async (predictionData: PredictionRequest) => {
-    const res = await instance.post<Prediction>('/predict', predictionData).then(data => {
-        const socketUrl = `ws://localhost:8000/ws/predict/${data.data.request_id}/`
+    const response = await instance.post<Prediction>('/predict/', predictionData)
+    const prediction = response.data
 
-        socketService.connect(socketUrl, (event) => {
-            if (event.data.event = socketDraftReady) {
-                store.dispatch(addDraft(event.data.draft))
-            }
+    // Render base response immediately; drafts will arrive over websocket.
+    store.dispatch(setPrediction(prediction))
 
-            if (event.data.event = socketPredictDone) {
-                socketService.disconnect()
-            }
-        })
+    const socketUrl = `ws://localhost:8000/ws/predict/${prediction.request_id}/`
+    socketService.connect(socketUrl, (event) => {
+        let payload: any = null
+        try {
+            payload = JSON.parse(event.data)
+        } catch {
+            return
+        }
 
-        return data.data
+        if (payload?.event === socketDraftReady && payload?.draft) {
+            store.dispatch(addDraft(payload.draft))
+        }
+
+        if (payload?.event === socketPredictDone) {
+            socketService.disconnect()
+        }
     })
 
-    return res
+    return prediction
 }

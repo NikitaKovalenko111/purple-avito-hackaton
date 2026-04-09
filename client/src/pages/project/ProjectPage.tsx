@@ -10,21 +10,21 @@ const ProjectPage: React.FC<PropsType> = (): JSX.Element => {
                 <div className="info__container container">
                 <header className="info__head">
                     <p className="info__eyebrow">Архитектура проекта</p>
-                    <h1 className="info__title" id="info-title-project">Как система принимает решение:</h1>
+                    <h1 className="info__title" id="info-title-project">Текущий pipeline принятия решения</h1>
                 </header>
 
                 <div className="info__cards">
                     <article className="info-card">
                     <h2 className="info-card__title">Этап 1: Поиск кандидатов</h2>
-                    <p className="info-card__text">TF-IDF биграммы и триграммы ищут категории по ключевым словам.</p>
+                    <p className="info-card__text">TF-IDF + char n-grams формируют detected-кандидатов и первичный скор по микрокатегориям.</p>
                     </article>
                     <article className="info-card">
-                    <h2 className="info-card__title">Этап 2: Вероятностная модель</h2>
-                    <p className="info-card__text">Текстовые эмбеддинги трансформера и обучаемые эмбеддинги микрокатегорий формируют softmax-вероятности.</p>
+                    <h2 className="info-card__title">Этап 2: Transformer + split head</h2>
+                    <p className="info-card__text">Transformer оценивает вероятности категорий и отдельно бинарное shouldSplit через split-head.</p>
                     </article>
                     <article className="info-card">
-                    <h2 className="info-card__title">Этап 3: Выдача черновиков</h2>
-                    <p className="info-card__text">Категории выше порога становятся кандидатами для черновиков. Результат экспортируется в ожидаемой JSON-схеме.</p>
+                    <h2 className="info-card__title">Этап 3: Реранжирование и JSON-ответ</h2>
+                    <p className="info-card__text">Пороги class/score и shouldSplit определяют splitCategories; при включенном режиме split может приравниваться к detected.</p>
                     </article>
                 </div>
 
@@ -32,9 +32,9 @@ const ProjectPage: React.FC<PropsType> = (): JSX.Element => {
                     <h2 className="timeline__title" id="timeline-title">Схема работы</h2>
                     <ol className="timeline__list">
                     <li className="timeline__item">Входное объявление попадает в рабочую панель.</li>
-                    <li className="timeline__item">Ретривер сужает список кандидатов.</li>
-                    <li className="timeline__item">Softmax-модель оценивает вероятность разделения.</li>
-                    <li className="timeline__item">Черновики формируются и экспортируются.</li>
+                    <li className="timeline__item">Сервис возвращает detectedMcIds без sourceMcId и с пороговой фильтрацией.</li>
+                    <li className="timeline__item">shouldSplit вычисляется по split-head и split_threshold.</li>
+                    <li className="timeline__item">Если shouldSplit=true, генерируются splitCategories и затем черновики по WebSocket.</li>
                     </ol>
                 </section>
                 </div>

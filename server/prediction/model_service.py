@@ -135,7 +135,7 @@ def run_prediction(payload: dict) -> dict:
     pipeline = get_pipeline()
 
     item = Item(
-        item_id=payload["itemId"],
+        item_id=0,
         mc_id=payload["sourceMcId"],
         mc_title=payload["sourceMcTitle"],
         description=payload["description"],
@@ -143,7 +143,33 @@ def run_prediction(payload: dict) -> dict:
 
     result = pipeline.predict(item)
 
-    detected_mc_ids = result.detected_mc_ids
+    # API detection output should not include the source category and should be confidence-filtered.
+    ranked_detected = sorted(
+        (
+            (mc_id, float(score))
+            for mc_id, score in result.probabilities.items()
+            if int(mc_id) != int(item.mc_id)
+        ),
+        key=lambda x: x[1],
+        reverse=True,
+    )
+
+    detected_mc_ids = [
+        mc_id
+        for mc_id, score in ranked_detected
+        if score >= pipeline.get_class_prob_threshold(mc_id)
+    ]
+
+    if not detected_mc_ids and ranked_detected:
+        # Keep at least one best candidate for UX stability.
+        detected_mc_ids = [ranked_detected[0][0]]
+
+    if pipeline.top_k_drafts > 0:
+        detected_mc_ids = detected_mc_ids[: pipeline.top_k_drafts]
+
+    if pipeline.max_drafts > 0:
+        detected_mc_ids = detected_mc_ids[: pipeline.max_drafts]
+
     should_split = result.should_split
 
     split_categories = [

@@ -10,7 +10,7 @@ const MetricsPage: React.FC<PropsType> = (): JSX.Element => {
                 <div className="info__container container">
                 <header className="info__head">
                     <p className="info__eyebrow">Оценка</p>
-                    <h1 className="info__title" id="info-title-metrics">Метрики качества и интерпретация</h1>
+                    <h1 className="info__title" id="info-title-metrics">Текущие метрики (последний запуск)</h1>
                 </header>
 
                 <div className="info__cards">
@@ -33,11 +33,12 @@ const MetricsPage: React.FC<PropsType> = (): JSX.Element => {
                 </div>
 
                 <section className="kpi" aria-labelledby="kpi-title">
-                    <h2 className="kpi__title" id="kpi-title">Рекомендуемые целевые диапазоны</h2>
+                    <h2 className="kpi__title" id="kpi-title">Фактические значения</h2>
                     <ul className="kpi__list">
-                    <li className="kpi__item">Micro F1: 0.70+ для надежного пилота</li>
-                    <li className="kpi__item">shouldSplit accuracy: 0.80+ для стабильного рабочего процесса</li>
-                    <li className="kpi__item">Ограничение по точности: избегать шумных лишних черновиков</li>
+                    <li className="kpi__item">Val split: precision 0.816, recall 0.427, F1 0.561, shouldSplit accuracy 0.511</li>
+                    <li className="kpi__item">Val detect: precision 0.519, recall 0.934, F1 0.667</li>
+                    <li className="kpi__item">Test split: precision 0.780, recall 0.450, F1 0.571, shouldSplit accuracy 0.495</li>
+                    <li className="kpi__item">Test detect: precision 0.473, recall 0.927, F1 0.626</li>
                     </ul>
                 </section>
                 </div>

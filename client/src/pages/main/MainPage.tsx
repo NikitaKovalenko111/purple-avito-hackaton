@@ -1,10 +1,41 @@
-import type { JSX } from "react";
+import { useState, type JSX } from "react";
 import type React from "react";
+import { useSelector } from "react-redux";
 import { Link } from "react-router-dom";
+import { type RootState } from "../../redux/store";
+import { categoriesRefs, type Draft } from "../../types";
+import { getPrediction } from "../../api/api";
 
 type PropsType = {}
 
 const MainPage: React.FC<PropsType> = (): JSX.Element => {
+    const categories = useSelector((state: RootState) => state.prediction.prediction?.detectedMcIds)
+    const shouldSplit = useSelector((state: RootState) => state.prediction.prediction?.shouldSplit)
+    const drafts = useSelector((state: RootState) => state.prediction.prediction?.drafts)
+
+    const [description, setDescription] = useState<string>("")
+    const [sourceMcId, setSourceMcId] = useState<number>(101)
+    const [isLoading, setIsLoading] = useState<boolean>(false)
+
+    const handleAnalyze = async () => {
+        if (!description.trim() || isLoading) {
+            return
+        }
+
+        try {
+            setIsLoading(true)
+            await getPrediction({
+                sourceMcId,
+                sourceMcTitle: categoriesRefs[sourceMcId],
+                description,
+            })
+        } catch (error) {
+            console.error("Prediction request failed", error)
+        } finally {
+            setIsLoading(false)
+        }
+    }
+
     return (
         <main className="page__main page__main--workspace">
             <section className="workspace" aria-labelledby="workspace-title">
@@ -26,24 +57,41 @@ const MainPage: React.FC<PropsType> = (): JSX.Element => {
                 <div className="workspace__grid">
                     <section className="panel panel--form" aria-labelledby="panel-form-title">
                     <h2 className="panel__title" id="panel-form-title">Введите объявление</h2>
-                    <form className="ad-form" action="#" method="post">
+                    <form
+                        className="ad-form"
+                        onSubmit={(event) => {
+                            event.preventDefault()
+                            handleAnalyze()
+                        }}
+                    >
                         <div className="ad-form__field">
                         <label className="ad-form__label" htmlFor="ad-source">Исходная категория</label>
-                        <select className="ad-form__control" id="ad-source" name="source">
-                            <option>101 - Ремонт под ключ</option>
-                            <option>102 - Сантехника</option>
-                            <option>103 - Электрика</option>
-                            <option>104 - Натяжные потолки</option>
-                            <option>105 - Укладка плитки</option>
+                        <select value={sourceMcId} onChange={(el) => {
+                            setSourceMcId(parseInt(el.target.value))
+                        }} className="ad-form__control" id="ad-source" name="source">
+                            {Object.entries(categoriesRefs).map(([id, title]) => (
+                                <option key={id} value={id}>
+                                    {id} - {title}
+                                </option>
+                            ))}
                         </select>
                         </div>
 
                         <div className="ad-form__field">
                         <label className="ad-form__label" htmlFor="listing-description">Описание объявления</label>
-                        <textarea className="ad-form__control ad-form__control--textarea" id="listing-description" name="description" rows={9}>Делаем ремонт под ключ, отдельно выполняем электрику, сантехнику и укладку плитки. Работаем по договору, выезд и смета бесплатно.</textarea>
+                        <textarea
+                            value={description}
+                            onChange={(el) => {
+                                setDescription(el.target.value)
+                            }}
+                            className="ad-form__control ad-form__control--textarea"
+                            id="listing-description"
+                            name="description"
+                            rows={9}
+                        />
                         </div>
 
-                        <div className="ad-form__field ad-form__field--row">
+                        {/*<div className="ad-form__field ad-form__field--row">
                         <div className="ad-form__field-item">
                             <label className="ad-form__label" htmlFor="ad-prob">Порог разделения</label>
                             <input className="ad-form__control" id="ad-prob" name="threshold" type="number" min="0" max="1" step="0.01" value="0.30" />
@@ -52,10 +100,19 @@ const MainPage: React.FC<PropsType> = (): JSX.Element => {
                             <label className="ad-form__label" htmlFor="ad-topk">Максимальное количество микрокатегорий</label>
                             <input className="ad-form__control" id="ad-topk" name="topk" type="number" min="1" max="15" step="1" value="8" />
                         </div>
-                        </div>
+                        </div>*/}
 
                         <div className="ad-form__actions">
-                        <button className="ad-form__button ad-form__button--primary" type="button">Анализ</button>
+                        <button
+                            onClick={() => {
+                                handleAnalyze()
+                            }}
+                            className="ad-form__button ad-form__button--primary"
+                            type="button"
+                            disabled={isLoading}
+                        >
+                            {isLoading ? "Анализ..." : "Анализ"}
+                        </button>
                         <button className="ad-form__button ad-form__button--ghost" type="button">Сбросить</button>
                         </div>
                     </form>
@@ -67,29 +124,33 @@ const MainPage: React.FC<PropsType> = (): JSX.Element => {
                     <article className="result-card">
                         <h3 className="result-card__title">Найденные микрокатегории</h3>
                         <ul className="result-card__chips">
-                        <li className="result-card__chip">102 Сантехника</li>
-                        <li className="result-card__chip">103 Электрика</li>
-                        <li className="result-card__chip">105 Укладка плитки</li>
+                        {categories?.map((el) => (
+                            <li className="result-card__chip" key={el}>
+                                {el} {categoriesRefs[el] ?? "Неизвестная категория"}
+                            </li>
+                        ))}
                         </ul>
                     </article>
 
                     <article className="result-card">
                         <h3 className="result-card__title">Следует разделить?</h3>
-                        <p className="result-card__decision result-card__decision--yes">Нужно разделить: да</p>
-                        <p className="result-card__text">3 микрокатегории превысили порог и отличны от исходной категории</p>
+                        <p className={`result-card__decision ${shouldSplit ? 'result-card__decision--yes' : 'result-card__decision--no'}`}>Нужно разделить: {shouldSplit ? 'Да' : 'Нет'}</p>
+                        {/*<p className="result-card__text">3 микрокатегории превысили порог и отличны от исходной категории</p>*/}
                     </article>
 
                     <article className="result-card">
-                        <h3 className="result-card__title">Пример черновика</h3>
+                        <h3 className="result-card__title">Черновики</h3>
                         <ul className="result-card__drafts">
-                        <li className="result-card__draft">
-                            <h4 className="result-card__draft-title">102 Сантехника</h4>
-                            <p className="result-card__draft-text">Выполняем сантехнические работы отдельно: разводка труб, установка сантехники, замена смесителей.</p>
-                        </li>
-                        <li className="result-card__draft">
-                            <h4 className="result-card__draft-title">103 Электрика</h4>
-                            <p className="result-card__draft-text">Отдельно делаем электромонтаж: замена проводки, перенос розеток и установка освещения.</p>
-                        </li>
+                        {
+                            drafts?.map((el: Draft) => {
+                                return (
+                                    <li className="result-card__draft" key={`${el.mcId}-${el.mcTitle}`}>
+                                        <h4 className="result-card__draft-title">{el.mcId} {el.mcTitle}</h4>
+                                        <p className="result-card__draft-text">{el.text}</p>
+                                    </li>
+                                )
+                            })
+                        }
                         </ul>
                     </article>
                     </section>
