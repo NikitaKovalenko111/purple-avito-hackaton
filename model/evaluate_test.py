@@ -96,6 +96,24 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _resolve_checkpoint_path(raw_path: Path) -> Path:
+    checkpoint_path = Path(raw_path)
+    if checkpoint_path.exists() and checkpoint_path.suffix.lower() == ".json":
+        candidates = [
+            checkpoint_path.parent / "cv_best_fold_checkpoint.pt",
+            checkpoint_path.parent / "model_checkpoint.pt",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                print(f"Resolved JSON report to checkpoint: {candidate}")
+                return candidate
+        raise ValueError(
+            f"Checkpoint path points to JSON report: {checkpoint_path}. "
+            "Could not find cv_best_fold_checkpoint.pt or model_checkpoint.pt next to it."
+        )
+    return checkpoint_path
+
+
 def _load_checkpoint(checkpoint_path: Path) -> Dict[str, Any]:
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
@@ -103,6 +121,11 @@ def _load_checkpoint(checkpoint_path: Path) -> Dict[str, Any]:
     try:
         checkpoint = torch.load(str(checkpoint_path), map_location="cpu")
     except Exception as exc:
+        if "invalid load key, '{'" in str(exc):
+            raise ValueError(
+                f"File is not a PyTorch checkpoint: {checkpoint_path}. "
+                "Looks like a JSON file; pass a .pt checkpoint path instead."
+            ) from exc
         if "Weights only load failed" not in str(exc):
             raise
         checkpoint = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
@@ -115,7 +138,6 @@ def _load_checkpoint(checkpoint_path: Path) -> Dict[str, Any]:
 def _load_items(data_dir: Path, use_jsonl: bool, dataset_file: Path | None = None) -> List[Any]:
     if dataset_file is not None:
         dataset_file = Path(dataset_file)
-        # If absolute, use as-is. Otherwise, try relative-to-cwd first, then relative-to-data_dir
         if dataset_file.is_absolute():
             dataset_path = dataset_file
         elif dataset_file.exists():
@@ -302,7 +324,8 @@ def main() -> None:
     args = parse_args()
 
     started_at = time.time()
-    checkpoint = _load_checkpoint(args.checkpoint_path)
+    resolved_checkpoint_path = _resolve_checkpoint_path(args.checkpoint_path)
+    checkpoint = _load_checkpoint(resolved_checkpoint_path)
     checkpoint_config = checkpoint.get("config", {}) if isinstance(checkpoint.get("config"), dict) else {}
 
     data_dir = args.data_dir
@@ -373,7 +396,7 @@ def main() -> None:
         elapsed_sec = time.time() - started_at
         settings = fold_settings
         report = {
-            "checkpoint_path": str(args.checkpoint_path),
+            "checkpoint_path": str(resolved_checkpoint_path),
             "data_dir": str(data_dir),
             "dataset_file": str(args.dataset_file) if args.dataset_file is not None else None,
             "split": args.split,
@@ -407,7 +430,7 @@ def main() -> None:
         }
 
         print("=== StratifiedKFold Evaluation Report ===")
-        print(f"Checkpoint: {args.checkpoint_path}")
+        print(f"Checkpoint: {resolved_checkpoint_path}")
         print(f"Dataset split: {args.split} ({len(eval_items)} items)")
         print(f"n_splits: {args.stratified_kfold}")
         print(f"Split target mode: {settings.split_target_mode}")
@@ -429,7 +452,7 @@ def main() -> None:
         elapsed_sec = time.time() - started_at
 
         report = {
-            "checkpoint_path": str(args.checkpoint_path),
+            "checkpoint_path": str(resolved_checkpoint_path),
             "data_dir": str(data_dir),
             "dataset_file": str(args.dataset_file) if args.dataset_file is not None else None,
             "split": args.split,
@@ -460,7 +483,7 @@ def main() -> None:
         }
 
         print("=== Evaluation Report ===")
-        print(f"Checkpoint: {args.checkpoint_path}")
+        print(f"Checkpoint: {resolved_checkpoint_path}")
         print(f"Dataset split: {args.split} ({len(eval_items)} items)")
         print(f"Split target mode: {settings.split_target_mode}")
         print(f"Device: {settings.device}")

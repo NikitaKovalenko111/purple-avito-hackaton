@@ -50,7 +50,6 @@ def _require_transformers() -> None:
 
 
 def _load_tokenizer(model_name: str) -> Any:
-    """Load tokenizer from local cache first to avoid Hugging Face rate limits."""
     try:
         return AutoTokenizer.from_pretrained(model_name, local_files_only=True)
     except Exception as local_exc:
@@ -64,7 +63,6 @@ def _load_tokenizer(model_name: str) -> Any:
 
 
 def _load_text_encoder(model_name: str) -> Any:
-    """Load transformer encoder from local cache first to avoid Hugging Face rate limits."""
     try:
         return AutoModel.from_pretrained(model_name, local_files_only=True)
     except Exception as local_exc:
@@ -184,7 +182,7 @@ class TrainingSettings:
     lr: float = 3e-5
     weight_decay: float = 0.01
     split_loss_weight: float = 0.5
-    split_pos_weight: float = 5.0
+    split_pos_weight: float = 3.0
     patience: int = 2
     min_delta: float = 1e-4
     threshold_grid: Tuple[float, ...] = (0.08, 0.12, 0.16, 0.20, 0.24)
@@ -219,18 +217,14 @@ def _parse_int_list(raw_value: Any) -> List[int]:
 
 
 def _normalize_text_content(text: str) -> str:
-    """Normalize noisy user-generated text while preserving semantics."""
     if not text:
         return ""
 
     cleaned = unicodedata.normalize("NFKC", str(text))
-    # Some dataset rows contain literal escape sequences (e.g. "\\u2028") as plain text.
     cleaned = re.sub(r"\\u[0-9a-fA-F]{4}|\\U[0-9a-fA-F]{8}", " ", cleaned)
     cleaned = cleaned.replace("\u00A0", " ")
     cleaned = re.sub(r"[\r\n\t]+", " ", cleaned)
-    # Remove most emoji and pictographic symbols that add noise for retrieval/encoder.
     cleaned = re.sub(r"[\U0001F300-\U0001FAFF\U00002700-\U000027BF\U000024C2-\U0001F251]", " ", cleaned)
-    # Remove remaining unicode symbol noise (decorative blocks, dingbats, variation selectors).
     cleaned = "".join(ch if unicodedata.category(ch) not in {"So", "Sk", "Cs", "Cf"} else " " for ch in cleaned)
     cleaned = re.sub(r"[~]{3,}", " ", cleaned)
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
@@ -352,8 +346,6 @@ def split_dataset(items: Sequence[LabeledItem]) -> Dict[str, List[LabeledItem]]:
 
 
 class TfidfMicroCategoryRetriever:
-    """TF-IDF retriever over key phrases with bi/tri-grams and optional char n-grams for candidate filtering."""
-
     def __init__(
             self,
             ngram_range: Tuple[int, int] = (2, 3),
@@ -392,7 +384,6 @@ class TfidfMicroCategoryRetriever:
 
     @staticmethod
     def _mc_document(mc: MicroCategory) -> str:
-        # Duplicate key phrases in document to strengthen category-specific terms.
         phrases = [p.strip() for p in mc.key_phrases if p and p.strip()]
         return " ; ".join(phrases + phrases)
 
@@ -422,7 +413,6 @@ class TfidfMicroCategoryRetriever:
         query_vec = self.vectorizer.transform([text])
         sims = (query_vec @ self._mc_matrix.T).toarray().ravel()
 
-        # If char n-grams enabled, blend word and char similarities
         if self.use_char_ngrams and self._mc_matrix_char is not None:
             query_vec_char = self.char_vectorizer.transform([text])
             sims_char = (query_vec_char @ self._mc_matrix_char.T).toarray().ravel()
@@ -442,13 +432,6 @@ class TfidfMicroCategoryRetriever:
 
 
 class TransformerSoftmaxSplitModel(_BaseModule):
-    """
-    Softmax model:
-    - Transformer encodes ad text.
-    - Trainable embedding table encodes microcategories.
-    - Dot-product logits -> probability distribution over candidate microcategories.
-    """
-
     def __init__(
             self,
             model_name: str,
@@ -666,8 +649,6 @@ class TransformerSoftmaxSplitModel(_BaseModule):
 
 
 class DraftSplitPipeline:
-    """End-to-end pipeline for category detection and draft split prediction."""
-
     def __init__(
             self,
             microcategories: Sequence[MicroCategory],
@@ -860,7 +841,6 @@ class DraftSplitPipeline:
         lower_sentence = sentence.lower()
         phrase_hits = sum(1 for phrase in self._phrase_lexicon if len(phrase) >= 4 and phrase in lower_sentence)
         uniq = len(set(words))
-        # Prefer informative sentences with phrase evidence and lexical diversity.
         return float(phrase_hits * 3 + uniq)
 
     def _select_informative_sentences(self, text: str) -> str:
@@ -1030,7 +1010,6 @@ class DraftSplitPipeline:
         return float(total_loss.detach().cpu().item())
 
     def build_candidates(self, item: Item, force_include: Optional[Sequence[int]] = None) -> List[int]:
-        # In the current problem we only have 11 microcategories, so filtering is not necessary.
         candidates = [mc.mc_id for mc in self.microcategories]
         if force_include:
             for mc_id in force_include:
@@ -1491,7 +1470,6 @@ class DraftSplitPipeline:
 
 
 def to_response_json(result: PredictionResult) -> Dict[str, object]:
-    """Convert internal output to the hackathon response schema."""
     return {
         "detectedMcIds": result.detected_mc_ids,
         "shouldSplit": result.should_split,
@@ -1510,7 +1488,6 @@ def evaluate_split_quality(
         pipeline: DraftSplitPipeline,
         items: Sequence[LabeledItem],
 ) -> Dict[str, float]:
-    """Compute micro Precision/Recall/F1 for the configured split target mode and shouldSplit accuracy."""
     tp = 0
     fp = 0
     fn = 0
@@ -1530,12 +1507,14 @@ def evaluate_split_quality(
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
     accuracy = correct_split / len(items) if items else 0.0
+    composite = (precision + recall + accuracy) / 3.0
 
     return {
         "precision_micro": precision,
         "recall_micro": recall,
         "f1_micro": f1,
         "should_split_accuracy": accuracy,
+        "composite_score": composite,
     }
 
 
@@ -1543,7 +1522,6 @@ def evaluate_detect_quality(
         pipeline: DraftSplitPipeline,
         items: Sequence[LabeledItem],
 ) -> Dict[str, float]:
-    """Compute micro Precision/Recall/F1 for detected categories against targetDetectedMcIds."""
     tp = 0
     fp = 0
     fn = 0
@@ -1573,6 +1551,8 @@ def _selection_score(metrics: Dict[str, float], optimize_for: str, min_recall: f
     precision = float(metrics.get("precision_micro", 0.0))
     recall = float(metrics.get("recall_micro", 0.0))
     f1 = float(metrics.get("f1_micro", 0.0))
+    should_split_accuracy = float(metrics.get("should_split_accuracy", 0.0))
+    composite = float(metrics.get("composite_score", (precision + recall + should_split_accuracy) / 3.0))
 
     if recall < float(min_recall):
         return -1.0
@@ -1581,6 +1561,8 @@ def _selection_score(metrics: Dict[str, float], optimize_for: str, min_recall: f
         return precision
     if opt == "recall":
         return recall
+    if opt in {"composite", "joint"}:
+        return composite
     return f1
 
 
@@ -1835,7 +1817,6 @@ def evaluate_retrieval_recall(
         pipeline: DraftSplitPipeline,
         items: Sequence[LabeledItem],
 ) -> float:
-    # With full candidate set this becomes a sanity metric rather than a filter metric.
     total = 0
     hit = 0
     for item in items:

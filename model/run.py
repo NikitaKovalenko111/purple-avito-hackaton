@@ -4,6 +4,7 @@ import argparse
 import copy
 import importlib
 import json
+import math
 import os
 from dataclasses import replace
 from pathlib import Path
@@ -245,9 +246,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--optimize-for",
-        choices=["f1", "precision", "recall"],
+        choices=["f1", "precision", "recall", "composite"],
         default="f1",
-        help="Metric used for threshold/control search on validation.",
+        help="Metric used for threshold/control search on validation (composite = mean of precision, recall, shouldSplit accuracy).",
     )
     parser.add_argument(
         "--min-recall",
@@ -426,7 +427,6 @@ def load_items(data_dir: Path, use_jsonl: bool, dataset_file: Path | None = None
             return load_labeled_items_jsonl(str(dataset_path))
         if suffix == ".csv":
             return load_labeled_items_csv(str(dataset_path))
-        # Fallback for files without extension: use --use-jsonl toggle.
         if use_jsonl:
             return load_labeled_items_jsonl(str(dataset_path))
         return load_labeled_items_csv(str(dataset_path))
@@ -465,9 +465,6 @@ def _load_checkpoint(checkpoint_path: Path) -> Dict[str, Any]:
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
-    # PyTorch 2.6 changed default torch.load(..., weights_only=True).
-    # Our checkpoints include metadata (e.g. custom classes), so we fall back
-    # to weights_only=False for trusted local files.
     try:
         checkpoint = torch.load(str(checkpoint_path), map_location="cpu")
     except Exception as exc:
@@ -496,14 +493,12 @@ def _load_env_file(env_path: Path) -> None:
             if not key:
                 continue
 
-            # Do not override already exported environment variables.
             os.environ.setdefault(key, value)
 
 
 def main() -> None:
     _require_torch()
 
-    # Support local secrets/config via .env without external dependencies.
     project_root = Path(__file__).resolve().parent.parent
     _load_env_file(project_root / ".env")
 
@@ -689,12 +684,12 @@ def main() -> None:
         base_class_thresholds = dict(fold_pipeline.class_prob_thresholds)
         best_fold_score = -1.0
         best_fold_index = 0
+        best_fold_checkpoint_path = output_dir / "cv_best_fold_checkpoint.pt"
 
         for fold_idx, (fold_train_idx, fold_val_idx) in enumerate(skf.split(cv_pool, cv_labels), start=1):
             fold_train_items = [cv_pool[i] for i in fold_train_idx]
             fold_val_items = [cv_pool[i] for i in fold_val_idx]
 
-            # Reset model/settings to the same initial state for every fold.
             fold_pipeline.model.load_state_dict(base_model_state, strict=True)
             fold_pipeline.model.train()
             fold_pipeline.prob_threshold = float(pipeline_settings.prob_threshold)
@@ -810,11 +805,15 @@ def main() -> None:
             }
             fold_reports.append(fold_report)
 
-            fold_score = float(fold_split_metrics.get("f1_micro", 0.0))
-            if fold_score > best_fold_score:
+            raw_fold_score = float(fold_split_metrics.get("f1_micro", 0.0))
+            fold_score = raw_fold_score if math.isfinite(raw_fold_score) else float("-inf")
+            if not math.isfinite(raw_fold_score):
+                print(f"[Fold {fold_idx}] warning: non-finite split_f1={raw_fold_score}; using -inf for best-fold selection")
+
+            should_update_best = fold_idx == 1 or (not best_fold_checkpoint_path.exists()) or (fold_score > best_fold_score)
+            if should_update_best:
                 best_fold_score = fold_score
                 best_fold_index = fold_idx
-                best_fold_checkpoint_path = output_dir / "cv_best_fold_checkpoint.pt"
                 torch.save(
                     {
                         "model_state": fold_pipeline.model.state_dict(),
@@ -871,6 +870,80 @@ def main() -> None:
             std_value = aggregate["std"].get(key, 0.0)
             print(f"  {key}: {mean_value:.4f} ± {std_value:.4f}")
 
+        post_cv_report: Dict[str, Any] = {}
+        if best_fold_checkpoint_path.exists():
+            print("\nPost-CV: loading best fold checkpoint for full tuning + test...")
+            best_checkpoint = _load_checkpoint(best_fold_checkpoint_path)
+            fold_pipeline.model.load_state_dict(best_checkpoint["model_state"], strict=False)
+            fold_pipeline.model.eval()
+
+            if val_items:
+                print("Post-CV: full threshold tuning on validation split...")
+                threshold_report = search_best_probability_threshold(
+                    fold_pipeline,
+                    val_items,
+                    training_settings.threshold_grid,
+                    optimize_for=args.optimize_for,
+                    min_recall=args.min_recall,
+                )
+                fold_pipeline.prob_threshold = threshold_report["threshold"]
+
+                split_threshold_report = evaluate_split_probability_threshold(
+                    fold_pipeline,
+                    val_items,
+                    args.split_threshold_grid,
+                    optimize_for=args.optimize_for,
+                    min_recall=args.min_recall,
+                )
+                fold_pipeline.split_threshold = split_threshold_report["threshold"]
+
+                class_threshold_report = search_best_class_probability_thresholds(
+                    fold_pipeline,
+                    val_items,
+                    args.class_threshold_grid,
+                    optimize_for=args.optimize_for,
+                    min_recall=args.min_recall,
+                )
+                fold_pipeline.set_class_prob_thresholds(class_threshold_report["class_thresholds"])
+
+                reranking_report = search_best_reranking_controls(
+                    fold_pipeline,
+                    val_items,
+                    args.top_k_drafts_grid,
+                    args.max_drafts_grid,
+                    args.score_margin_grid,
+                    args.relative_ratio_grid,
+                    args.score_blend_alpha_grid,
+                    optimize_for=args.optimize_for,
+                    min_recall=args.min_recall,
+                )
+                best_controls = reranking_report["best_controls"]
+                fold_pipeline.top_k_drafts = best_controls["top_k_drafts"]
+                fold_pipeline.set_reranking_controls(
+                    max_drafts=best_controls["max_drafts"],
+                    score_margin=best_controls["score_margin"],
+                    relative_ratio=best_controls["relative_ratio"],
+                    score_blend_alpha=best_controls["score_blend_alpha"],
+                )
+
+                post_cv_report["val"] = {
+                    "threshold_report": threshold_report,
+                    "split_threshold_report": split_threshold_report,
+                    "class_threshold_report": class_threshold_report,
+                    "reranking_report": reranking_report,
+                    "split_metrics": evaluate_split_quality(fold_pipeline, val_items),
+                    "detect_metrics": evaluate_detect_quality(fold_pipeline, val_items),
+                    "retrieval_recall": evaluate_retrieval_recall(fold_pipeline, val_items),
+                }
+
+            if test_items:
+                print(f"Post-CV: test evaluation ({len(test_items)} items)...")
+                post_cv_report["test"] = {
+                    "split_metrics": evaluate_split_quality(fold_pipeline, test_items),
+                    "detect_metrics": evaluate_detect_quality(fold_pipeline, test_items),
+                    "retrieval_recall": evaluate_retrieval_recall(fold_pipeline, test_items),
+                }
+
         with cv_report_path.open("w", encoding="utf-8") as f:
             json.dump(
                 {
@@ -883,6 +956,7 @@ def main() -> None:
                     "best_fold_f1": best_fold_score,
                     "folds": fold_reports,
                     "aggregate": aggregate,
+                    "post_cv": post_cv_report,
                 },
                 f,
                 ensure_ascii=False,
@@ -901,7 +975,6 @@ def main() -> None:
         print("Model weights initialized from checkpoint. Training will continue from this state.")
 
     llm_requested = bool(pipeline.use_llm_drafts)
-    # Metrics should be deterministic and fast: avoid LLM calls on full val/test sets.
     pipeline.use_llm_drafts = False
     print(f"LLM drafts enabled: {llm_requested}")
     if llm_requested:
@@ -909,7 +982,6 @@ def main() -> None:
         print(f"OpenRouter API key present: {bool(pipeline.openrouter_api_key)}")
 
     if not checkpoint_mode and llm_requested:
-        # Keep training/tuning deterministic and fast: use template drafts in this phase.
         print("LLM drafts are disabled for training/validation/test metrics and enabled only for sample output.")
 
     if checkpoint_mode:
@@ -977,8 +1049,6 @@ def main() -> None:
             balance_should_split_batches=training_settings.balance_should_split_batches,
             batch_false_ratio=training_settings.batch_false_ratio,
             batch_true_ratio=training_settings.batch_true_ratio,
-            # cross-encoder loss is handled inside train_step through pipeline settings
-            # cross-encoder loss is handled inside train_step through pipeline settings
             verbose=True,
         )
         print(f"Loss history: {losses}")
@@ -1078,7 +1148,6 @@ def main() -> None:
         print(json.dumps(pipeline.get_llm_diagnostics(), ensure_ascii=False, indent=2))
 
     if not checkpoint_mode:
-        # Save model checkpoint
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         model_checkpoint_path = output_dir / "model_checkpoint.pt"
@@ -1132,7 +1201,6 @@ def main() -> None:
         )
         print("Model saved")
 
-        # Save pipeline settings as JSON for reference
         settings_path = output_dir / "pipeline_settings.json"
         settings_json = checkpoint_config
         with open(settings_path, "w", encoding="utf-8") as f:
