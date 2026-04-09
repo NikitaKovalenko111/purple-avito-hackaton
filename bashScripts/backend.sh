@@ -17,19 +17,25 @@ fi
 
 echo "Создание окружения..."
 
+cd "$BACKEND_DIR"
+
 $PY -m venv .venv
 source .venv/bin/activate
 
-echo "Установка библиотек..."
 
-pip install -r "$BACKEND_DIR/requirements.txt"
 
-echo "Миграция базы данных..."
+log_info "Установка библиотек..."
 
-$PY "$BACKEND_DIR/manage.py" migrate
+pip install -r requirements.txt
 
-echo "Запуск сервера..."
+log_info "Миграция базы данных..."
 
-$PY "$BACKEND_DIR/manage.py" runserver
+$PY manage.py migrate
 
-echo "Сервер запущен"
+log_info "Запуск сервера..."
+
+$PY manage.py runserver
+
+cd $OLDPWD
+
+log_info "Сервер запущен"

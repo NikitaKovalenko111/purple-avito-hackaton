@@ -9,18 +9,18 @@ if command -v python3 &>/dev/null; then
 elif command -v python &>/dev/null; then
     PY=python
 else
-    echo "Python не найден. Установите python3." >&2
+    log_error "Python не найден. Установите python3." >&2
     exit 1
 fi
 
-echo "Проверка модели..."
+log_info "Проверка модели..."
 
 
 
-if [ ! -f "$MODEL_DIR\checkpoints\model_checkpoint.pt" ]; then
-    echo "Создание модели..."
+if [ ! -f "$MODEL_DIR/checkpoints/model_checkpoint.pt" ]; then
+    log_info "Создание модели..."
     $PY "$MODEL_DIR/run.py"
-    echo "Модель обучена"
+    log_info "Модель обучена"
 else
-    echo "Модель уже существует"
+    log_info "Модель уже существует"
 fi

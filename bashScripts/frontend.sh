@@ -2,17 +2,17 @@
 set -euo pipefail
 
 if command -v npm &>/dev/null; then
-    echo "npm установлен (версия: $(npm -v))"
+    log_info "npm установлен (версия: $(npm -v))"
 else
-    echo "npm не найден. Установите Node.js или npm." >&2
+    log_error "npm не найден. Установите Node.js или npm." >&2
     exit 1
 fi
 
-echo "Запуск клиента..."
+log_info "Запуск клиента..."
 
 cd ./client
 npm install 
 npm run dev
 cd ..
 
-echo "Клиент запущен"
+log_info "Клиент запущен"
