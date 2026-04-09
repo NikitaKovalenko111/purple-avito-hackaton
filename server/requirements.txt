@@ -51,7 +51,6 @@ regex==2026.4.4
 requests==2.33.1
 rich==14.3.3
 safetensors==0.7.0
-scikit-learn==1.8.0
 scipy==1.17.1
 service-identity==24.2.0
 shellingham==1.5.4
@@ -59,11 +58,7 @@ sqlparse==0.5.5
 sympy==1.14.0
 threadpoolctl==3.6.0
 tokenizers==0.22.2
-torch==2.11.0
-torchaudio==2.11.0
-torchvision==0.26.0
 tqdm==4.67.3
-transformers==5.5.0
 Twisted==25.5.0
 txaio==25.12.2
 typer==0.24.1
