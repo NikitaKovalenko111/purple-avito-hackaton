@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib
 import json
 import os
@@ -651,6 +652,10 @@ def main() -> None:
         )
 
         fold_reports: List[Dict[str, Any]] = []
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        cv_report_path = output_dir / "cv_training_report.json"
+
         print(
             f"Running StratifiedKFold training: n_splits={args.train_stratified_kfold}, "
             f"pool={args.cv_source_split}, size={len(cv_pool)}"
@@ -671,18 +676,37 @@ def main() -> None:
                 f"split_threshold_grid={list(fold_training_settings.split_threshold_grid)}"
             )
 
+        print("Initializing fold pipeline once (model/tokenizer load)...")
+        fold_pipeline = DraftSplitPipeline(
+            microcategories=microcategories,
+            settings=replace(pipeline_settings),
+        )
+        if args.init_from_checkpoint is not None:
+            fold_pipeline.model.load_state_dict(init_checkpoint["model_state"], strict=False)
+        fold_pipeline.use_llm_drafts = False
+
+        base_model_state = copy.deepcopy(fold_pipeline.model.state_dict())
+        base_class_thresholds = dict(fold_pipeline.class_prob_thresholds)
+        best_fold_score = -1.0
+        best_fold_index = 0
+
         for fold_idx, (fold_train_idx, fold_val_idx) in enumerate(skf.split(cv_pool, cv_labels), start=1):
             fold_train_items = [cv_pool[i] for i in fold_train_idx]
             fold_val_items = [cv_pool[i] for i in fold_val_idx]
 
-            fold_pipeline = DraftSplitPipeline(
-                microcategories=microcategories,
-                settings=replace(pipeline_settings),
+            # Reset model/settings to the same initial state for every fold.
+            fold_pipeline.model.load_state_dict(base_model_state, strict=True)
+            fold_pipeline.model.train()
+            fold_pipeline.prob_threshold = float(pipeline_settings.prob_threshold)
+            fold_pipeline.split_threshold = float(pipeline_settings.split_threshold)
+            fold_pipeline.top_k_drafts = int(pipeline_settings.top_k_drafts)
+            fold_pipeline.class_prob_thresholds = dict(base_class_thresholds)
+            fold_pipeline.set_reranking_controls(
+                max_drafts=int(pipeline_settings.max_drafts),
+                score_margin=float(pipeline_settings.score_margin),
+                relative_ratio=float(pipeline_settings.relative_ratio),
+                score_blend_alpha=float(pipeline_settings.score_blend_alpha),
             )
-            if args.init_from_checkpoint is not None:
-                fold_pipeline.model.load_state_dict(init_checkpoint["model_state"], strict=False)
-
-            fold_pipeline.use_llm_drafts = False
             fold_optimizer = AdamW(
                 fold_pipeline.model.parameters(),
                 lr=training_settings.lr,
@@ -786,6 +810,55 @@ def main() -> None:
             }
             fold_reports.append(fold_report)
 
+            fold_score = float(fold_split_metrics.get("f1_micro", 0.0))
+            if fold_score > best_fold_score:
+                best_fold_score = fold_score
+                best_fold_index = fold_idx
+                best_fold_checkpoint_path = output_dir / "cv_best_fold_checkpoint.pt"
+                torch.save(
+                    {
+                        "model_state": fold_pipeline.model.state_dict(),
+                        "config": {
+                            "transformer_name": transformer_name,
+                            "prob_threshold": fold_pipeline.prob_threshold,
+                            "split_threshold": fold_pipeline.split_threshold,
+                            "class_prob_thresholds": fold_pipeline.class_prob_thresholds,
+                            "max_drafts": fold_pipeline.max_drafts,
+                            "score_margin": fold_pipeline.score_margin,
+                            "relative_ratio": fold_pipeline.relative_ratio,
+                            "score_blend_alpha": fold_pipeline.score_blend_alpha,
+                            "top_k_drafts": fold_pipeline.top_k_drafts,
+                            "split_target_mode": fold_pipeline.split_target_mode,
+                            "split_equals_detected_when_should_split": fold_pipeline.split_equals_detected_when_should_split,
+                        },
+                        "transformer_name": transformer_name,
+                        "microcategories": microcategories,
+                        "best_fold": best_fold_index,
+                        "best_fold_f1": best_fold_score,
+                    },
+                    str(best_fold_checkpoint_path),
+                )
+
+            partial_aggregate = _aggregate_fold_metrics(fold_reports)
+            with cv_report_path.open("w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "mode": "train_stratified_kfold",
+                        "status": "in_progress",
+                        "n_splits": args.train_stratified_kfold,
+                        "cv_source_split": args.cv_source_split,
+                        "cv_random_state": args.cv_random_state,
+                        "completed_folds": len(fold_reports),
+                        "best_fold": best_fold_index,
+                        "best_fold_f1": best_fold_score,
+                        "folds": fold_reports,
+                        "aggregate": partial_aggregate,
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+
             print(
                 f"[Fold {fold_idx}] split_f1={fold_split_metrics['f1_micro']:.4f} "
                 f"shouldSplit_acc={fold_split_metrics['should_split_accuracy']:.4f} "
@@ -798,16 +871,16 @@ def main() -> None:
             std_value = aggregate["std"].get(key, 0.0)
             print(f"  {key}: {mean_value:.4f} ± {std_value:.4f}")
 
-        output_dir = Path(args.output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        cv_report_path = output_dir / "cv_training_report.json"
         with cv_report_path.open("w", encoding="utf-8") as f:
             json.dump(
                 {
                     "mode": "train_stratified_kfold",
+                    "status": "completed",
                     "n_splits": args.train_stratified_kfold,
                     "cv_source_split": args.cv_source_split,
                     "cv_random_state": args.cv_random_state,
+                    "best_fold": best_fold_index,
+                    "best_fold_f1": best_fold_score,
                     "folds": fold_reports,
                     "aggregate": aggregate,
                 },
