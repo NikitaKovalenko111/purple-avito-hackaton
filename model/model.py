@@ -49,6 +49,34 @@ def _require_transformers() -> None:
         raise ImportError("transformers is required. Install with: pip install transformers")
 
 
+def _load_tokenizer(model_name: str) -> Any:
+    """Load tokenizer from local cache first to avoid Hugging Face rate limits."""
+    try:
+        return AutoTokenizer.from_pretrained(model_name, local_files_only=True)
+    except Exception as local_exc:
+        try:
+            return AutoTokenizer.from_pretrained(model_name)
+        except Exception as online_exc:
+            raise RuntimeError(
+                f"Failed to load tokenizer for '{model_name}'. "
+                "Make sure the model is cached locally or the Hugging Face API is reachable."
+            ) from online_exc
+
+
+def _load_text_encoder(model_name: str) -> Any:
+    """Load transformer encoder from local cache first to avoid Hugging Face rate limits."""
+    try:
+        return AutoModel.from_pretrained(model_name, local_files_only=True)
+    except Exception as local_exc:
+        try:
+            return AutoModel.from_pretrained(model_name)
+        except Exception as online_exc:
+            raise RuntimeError(
+                f"Failed to load encoder for '{model_name}'. "
+                "Make sure the model is cached locally or the Hugging Face API is reachable."
+            ) from online_exc
+
+
 @dataclass
 class MicroCategory:
     mc_id: int
@@ -437,8 +465,8 @@ class TransformerSoftmaxSplitModel(_BaseModule):
         _require_torch()
         _require_transformers()
         super().__init__()
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.text_encoder = AutoModel.from_pretrained(model_name)
+        self.tokenizer = _load_tokenizer(model_name)
+        self.text_encoder = _load_text_encoder(model_name)
         encoder_hidden = self.text_encoder.config.hidden_size
         self.hidden_dim = hidden_dim or encoder_hidden
         self.max_length = max_length
