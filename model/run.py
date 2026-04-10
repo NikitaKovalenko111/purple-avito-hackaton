@@ -60,7 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset-file",
         type=Path,
-        default=None,
+        default="rnc_dataset_markup_balanced.csv",
         help="Optional dataset file path (csv/jsonl). Relative paths are resolved against --data-dir.",
     )
     parser.add_argument("--transformer-name", type=str, default="DeepPavlov/rubert-base-cased")
@@ -116,7 +116,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--long-text-max-windows",
         type=int,
-        default=4,
+        default=8,
         help="Max windows per text for --long-text-mode chunks.",
     )
     parser.add_argument(
@@ -247,13 +247,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--optimize-for",
         choices=["f1", "precision", "recall", "composite"],
-        default="f1",
+        default="composite",
         help="Metric used for threshold/control search on validation (composite = mean of precision, recall, shouldSplit accuracy).",
     )
     parser.add_argument(
         "--min-recall",
         type=float,
-        default=0.45,
+        default=0.0,
         help="Minimum recall constraint during validation searches.",
     )
     parser.add_argument("--use-jsonl", action="store_true", help="Load dataset from JSONL instead of CSV.")

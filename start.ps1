@@ -13,42 +13,42 @@ function Log-Info  { param($m) Write-Host "[INFO] $m" -ForegroundColor Green }
 function Log-Warn  { param($m) Write-Host "[WARN] $m" -ForegroundColor Yellow }
 function Log-Error { param($m) Write-Host "[ERROR] $m" -ForegroundColor Red }
 
-Log-Info "Запуск проекта..."
+Log-Info "Starting the project..."
 
 $Processes = @()
 
 function Stop-All {
-    Log-Warn "Завершение работы..."
+    Log-Warn "Ending..."
     foreach ($p in $Processes) {
         if ($p -and -not $p.HasExited) {
             Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
         }
     }
-    Log-Info "Все процессы остановлены."
+    Log-Info "All the processes are stopped."
 }
 
 try {
     $ModelScript = Join-Path $ScriptsDir "model.ps1"
     if (Test-Path $ModelScript) {
-        Log-Info "Проверка модели..."
+        Log-Info "Checking the model..."
         & $ModelScript
     }
 
-    Log-Info "Запуск бэкенда..."
+    Log-Info "Starting backend..."
     $BackendScript = Join-Path $ScriptsDir "backend.ps1"
     $Processes += Start-Process -FilePath "powershell.exe" `
         -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $BackendScript `
         -NoNewWindow -PassThru
-    Log-Info "Бэкенд запущен (PID: $($Processes[-1].Id))"
+    Log-Info "Backend is started (PID: $($Processes[-1].Id))"
 
-    Log-Info "Запуск фронтенда..."
+    Log-Info "Starting frontend...."
     $FrontendScript = Join-Path $ScriptsDir "frontend.ps1"
     $Processes += Start-Process -FilePath "powershell.exe" `
         -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $FrontendScript `
         -NoNewWindow -PassThru
-    Log-Info "Фронтенд запущен (PID: $($Processes[-1].Id))"
+    Log-Info "Frontend is started (PID: $($Processes[-1].Id))"
 
-    Write-Host "`nПроект запущен. Нажмите Ctrl+C для корректной остановки." -ForegroundColor Cyan
+    Write-Host "`nThe project has started. Press CRTL+C for correct stop." -ForegroundColor Cyan
 
     while ($true) {
         $anyAlive = $false

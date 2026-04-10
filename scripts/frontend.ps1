@@ -12,10 +12,10 @@ function Log-Warn  { param($m) Write-Host "[WARN] $m" -ForegroundColor Yellow }
 function Log-Error { param($m) Write-Host "[ERROR] $m" -ForegroundColor Red }
 
 $NpmCmd = Get-Command npm -ErrorAction SilentlyContinue
-if (-not $NpmCmd) { Log-Error "npm не найден. Установите Node.js."; exit 1 }
-Log-Info "npm установлен (версия: $(npm -v))"
+if (-not $NpmCmd) { Log-Error "npm isn't found. Install Node.js."; exit 1 }
+Log-Info "npm is installed (version: $(npm -v))"
 
-Log-Info "Запуск клиента..."
+Log-Info "Starting client..."
 Push-Location $ClientDir
 try {
     npm install

@@ -13,15 +13,15 @@ function Log-Error { param($m) Write-Host "[ERROR] $m" -ForegroundColor Red }
 
 $PyCmd = Get-Command python -ErrorAction SilentlyContinue
 if (-not $PyCmd) { $PyCmd = Get-Command python -ErrorAction SilentlyContinue }
-if (-not $PyCmd) { Log-Error "Python не найден. Установите python3."; exit 1 }
-Log-Info "Python установлен ($($PyCmd.Name))."
+if (-not $PyCmd) { Log-Error "Python isn't found. Install python3."; exit 1 }
+Log-Info "Python is installed ($($PyCmd.Name))."
 
 Push-Location $BackendDir
 try {
     $VenvDir = Join-Path $BackendDir ".venv"
     
     if (-not (Test-Path $VenvDir)) {
-        Log-Info "Создание окружения..."
+        Log-Info "Loading venv..."
         & $PyCmd.Source -m venv .venv
     }
 
@@ -29,17 +29,17 @@ try {
     if (Test-Path $ActivateScript) {
         & $ActivateScript
     } else {
-        Log-Error "Скрипт активации venv не найден: $ActivateScript"
+        Log-Error "Venv script activation isn't found: $ActivateScript"
         exit 1
     }
 
-    Log-Info "Установка библиотек..."
+    Log-Info "Installing dependencies..."
     pip install -r requirements.txt
 
-    Log-Info "Миграция базы данных..."
+    Log-Info "Migrating database..."
     & python manage.py migrate
 
-    Log-Info "Запуск сервера..."
+    Log-Info "Starting the server..."
     & python manage.py runserver
 }
 finally {
